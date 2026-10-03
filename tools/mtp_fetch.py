@@ -11,6 +11,9 @@ at the start of each shard, so HTTP range requests can read the headers and then
 `fetch` writes one raw file per tensor plus `mtp-manifest.json` (dtype, shape, source shard, byte range,
 sha256). It never downloads anything but the ranges named in the headers. Nothing here runs a model.
 
+#506: a checkpoint that is in the local huggingface_hub cache (`hf download`, Unsloth, ...) is read from disk
+instead: no request at all, not even for the index.  Only the revision this checkout is pinned to counts.
+
 #327: a mirror or proxy that ignores the Range header answers 200 with the whole shard - its JSON header and
 unrelated tensors - and a proxy may cut that to the requested length, so neither the size nor a hash of what was
 downloaded catches it (the drafter then accepts nothing, silently).  A range read therefore needs a 206 whose
@@ -20,11 +23,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # #214: a fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next
 # on 2026-09-30), so every install reads the same tensors; STRATA_MTP_REVISION overrides it (e.g. main).  When the
@@ -35,6 +40,9 @@ REVISION = os.environ.get("STRATA_MTP_REVISION") or PINNED_REVISION
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
+# #506: a checkpoint the user already has in the local huggingface_hub cache (from `hf download`, unsloth, ...) is
+# read from disk here and not fetched again - only the ~5 GB of MTP tensors, so nothing of the 360 GB is read.
+HF_RESOLVE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/(?P<rev>[0-9a-f]{40})/(?P<name>.+)$")
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
 
@@ -107,7 +115,45 @@ SHA256 = {
 }
 
 
+def hf_hub_cache() -> Path:
+    """The folder huggingface_hub caches models in: $HF_HUB_CACHE (the old $HUGGINGFACE_HUB_CACHE), else $HF_HOME/hub,
+    else $XDG_CACHE_HOME/huggingface/hub, else ~/.cache/huggingface/hub - the order huggingface_hub itself reads."""
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        v = (os.environ.get(var) or "").strip()
+        if v:
+            return Path(v)
+    home = (os.environ.get("HF_HOME") or "").strip()
+    if home:
+        return Path(home) / "hub"
+    xdg = (os.environ.get("XDG_CACHE_HOME") or "").strip()
+    return Path(xdg if xdg else Path.home() / ".cache") / "huggingface" / "hub"
+
+
+def cached(url: str):
+    """The file this URL names in the local hub cache, or None.  huggingface_hub keeps a repository under
+    <cache>/models--<org>--<name>/snapshots/<revision>/<its path in the repository>, each a symlink into blobs/.
+    Only the revision in the URL counts, and the hub links a file into snapshots/ only when it is whole (a running
+    download stays blobs/*.incomplete) - so a hit is the pinned bytes, and the SHA256 checks below still run."""
+    m = HF_RESOLVE.match(url)
+    if not m:
+        return None
+    p = hf_hub_cache() / ("models--" + m["repo"].replace("/", "--")) / "snapshots" / m["rev"] / m["name"]
+    return p if p.is_file() else None
+
+
 def get(url, start=None, end=None, retries=4):
+    """These bytes of `url`: from the hub cache when the checkpoint is in it (#506), else over HTTP.  A cached read
+    is a seek in a local file - no request, so it also works with no network - and it cannot be the mirror of #327."""
+    local = cached(url)
+    if local is not None:
+        with open(local, "rb") as f:
+            if start is None:
+                return f.read()
+            f.seek(start)
+            data = f.read(end - start + 1)
+        if len(data) != end - start + 1:
+            raise IOError("short range read: %d of %d" % (len(data), end - start + 1))
+        return data
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "strata-mtp-fetch"})
@@ -153,6 +199,8 @@ def sha256_of(path):
 def resolve_repo():
     """REPO, or the repository's current files when the pinned revision is gone from it (a 404 on its index)."""
     global REPO
+    if cached(REPO + "model.safetensors.index.json") is not None:
+        return REPO                                 # #506: the checkpoint is on disk, so there is nothing to ask
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
                                      headers={"User-Agent": "strata-mtp-fetch"})

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -68,6 +69,8 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
         t = Path(tmp)
         (t / "data" / "mtp" / "rt").mkdir(parents=True)
         (t / "data" / "mtp" / "rt" / "experts.bin").write_bytes(b"")
+        # #506: an empty hub cache, so what the menus say does not depend on what the machine running the tests has
+        (t / "hf-cache").mkdir()
         eng = t / "engine"
         eng.mkdir()
         (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.32", "source": "local", "cuda_dirs": ["<cuda>"]}))
@@ -103,6 +106,7 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
             mock.patch.object(setup, "page_file_gb", lambda: 16.0),
             mock.patch.object(setup, "is_wsl", lambda: False),
             mock.patch.object(setup, "free_gb", lambda p: 900.0),
+            mock.patch.dict(os.environ, {"HF_HUB_CACHE": str(t / "hf-cache"), "HF_HOME": str(t / "hf-home")}),
             mock.patch.object(setup, "pip_install", lambda *a, **k: None),
             mock.patch.object(setup, "get_llama_cpp", lambda: t / "llama.cpp"),
             mock.patch.object(setup, "get_prebuilt", lambda *a, **k: eng),

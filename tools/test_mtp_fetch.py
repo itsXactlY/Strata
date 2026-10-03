@@ -1,6 +1,7 @@
 """Tests for tools/mtp_fetch.py (#327): a range read needs a 206 with the asked Content-Range, the pinned revision's
 tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
-setup fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
+setup fetches it again), and an inventory from another revision is read again.  A checkpoint that is in the local
+huggingface_hub cache is read from disk instead (#506, no request at all).  A fake checkpoint behind a mocked
 urlopen - nothing is downloaded.
 
     python -m unittest tools.test_mtp_fetch
@@ -88,8 +89,11 @@ class FetchCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.out = Path(self.tmp.name)
+        self.hub = self.out / "nohub"                       # no checkpoint in a cache of its own: these tests fetch
+        self.hub.mkdir()
         self.patches = [mock.patch.object(M, "SHA256", HASHES), mock.patch.object(M.time, "sleep", lambda s: None),
-                        mock.patch.object(M, "REPO", M.PINNED)]
+                        mock.patch.object(M, "REPO", M.PINNED),
+                        mock.patch.dict(os.environ, {"HF_HUB_CACHE": str(self.hub)})]
         for p in self.patches:
             p.start()
 
@@ -181,6 +185,58 @@ class Pinned(unittest.TestCase):
             self.assertTrue(name.startswith("mtp."))
             self.assertRegex(h, "^[0-9a-f]{64}$")
         self.assertIn(M.PINNED_REVISION, M.PINNED)
+
+
+class HubCache(FetchCase):
+    """#506: the checkpoint in the local huggingface_hub cache.  `hf download` writes a repository under
+    <cache>/models--<org>--<name>/snapshots/<revision>/, every file a symlink into blobs/ - that is what is put here."""
+
+    def setUp(self):
+        super().setUp()
+        snap = self.hub / "models--Qwen--Qwen3.8-Flash-Next" / "snapshots" / M.PINNED_REVISION
+        blobs = self.hub / "models--Qwen--Qwen3.8-Flash-Next" / "blobs"
+        blobs.mkdir(parents=True)
+        snap.mkdir(parents=True)
+        (snap / "model.safetensors.index.json").write_bytes(INDEX)
+        for name, body in FILES.items():
+            blob = blobs / name.replace(".", "")                  # the hub names a blob after its etag, not the file
+            blob.write_bytes(body)
+            (snap / name).symlink_to(Path("../../blobs") / blob.name)   # snapshots/<rev>/x -> ../.. / blobs
+
+    def no_request(self, *a, **kw):
+        raise AssertionError("touched the network although the checkpoint is in the cache")
+
+    def test_inventory_and_fetch_read_it_from_disk(self):
+        with mock.patch.object(M.urllib.request, "urlopen", self.no_request), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            M.resolve_repo()
+            rows = M.inventory(str(self.out))
+            M.fetch(str(self.out), None)
+        self.assertEqual([r["name"] for r in rows], ["mtp.a", "mtp.b"])
+        self.assertEqual((self.tensor("mtp.a"), self.tensor("mtp.b")), (A, B))   # the checkpoint's real bytes
+        self.assertEqual(M.verify(str(self.out)), [])
+        manifest = json.loads((self.out / "mtp-manifest.json").read_text())
+        self.assertEqual({r["name"]: r["sha256"] for r in manifest}, HASHES)
+
+    def test_a_range_read_that_ends_past_the_file_is_refused(self):
+        with self.assertRaisesRegex(IOError, "short range read"):
+            M.get(M.REPO + "model-1.safetensors", 0, len(FILES["model-1.safetensors"]) + 10)
+
+    def test_another_revision_in_the_cache_is_not_used(self):
+        snap = self.hub / "models--Qwen--Qwen3.8-Flash-Next" / "snapshots"
+        for p in snap.iterdir():                       # only "main" is left: the pinned revision is gone from the cache
+            for f in p.iterdir():
+                f.unlink()
+            p.rmdir()
+        with mock.patch.object(M.urllib.request, "urlopen", Mirror()) as mirror:
+            self.fetch(mirror)
+        self.assertTrue(mirror.ranges, "the cache is not the pinned revision, so the network has to answer")
+
+    def test_a_cached_index_needs_no_head_request(self):
+        # the pinned index is on disk, so resolve_repo has nothing to ask the server (and cannot fall back to main
+        # just because the network is unreachable - #214's fallback is for a revision the repository dropped)
+        with mock.patch.object(M.urllib.request, "urlopen", self.no_request):
+            self.assertEqual(M.resolve_repo(), M.PINNED)
 
 
 class Setup(unittest.TestCase):

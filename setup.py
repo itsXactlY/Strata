@@ -88,6 +88,62 @@ def hf_unpinned(url: str) -> str:
     return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1main/", url, count=1)
 
 
+# #506: a model the user has already downloaded with `hf download` / huggingface_hub / transformers lies in that
+# library's cache, and setup asked the network for it again: 58 GB for the Coder's IQ1_M, 111 GB for the Unsloth.
+HF_RESOLVE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/(?P<rev>[0-9a-f]{40})/(?P<name>.+)$")
+
+
+def hf_hub_cache() -> Path:
+    """The folder huggingface_hub caches models in: $HF_HUB_CACHE (the old $HUGGINGFACE_HUB_CACHE), else $HF_HOME/hub,
+    else $XDG_CACHE_HOME/huggingface/hub, else ~/.cache/huggingface/hub - the order huggingface_hub itself reads."""
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        v = (os.environ.get(var) or "").strip()
+        if v:
+            return Path(v)
+    home = (os.environ.get("HF_HOME") or "").strip()
+    if home:
+        return Path(home) / "hub"
+    xdg = (os.environ.get("XDG_CACHE_HOME") or "").strip()
+    return Path(xdg if xdg else Path.home() / ".cache") / "huggingface" / "hub"
+
+
+def hf_cached(url: str):
+    """The file this Hugging Face URL names in the local hub cache, or None.  huggingface_hub stores a repository
+    under <cache>/models--<org>--<name>/snapshots/<revision>/<its path in the repository>, each a symlink into
+    blobs/.  Only the revision the URL asks for counts - another one's files are not the pinned ones - and the hub
+    links a file into snapshots/ only once it is whole (a running download stays blobs/*.incomplete), so this needs
+    no HEAD request and works with no network at all."""
+    m = HF_RESOLVE.match(url)
+    if not m:
+        return None
+    snap = hf_hub_cache() / ("models--" + m["repo"].replace("/", "--")) / "snapshots" / m["rev"]
+    exact = snap / m["name"]
+    if exact.exists():
+        return exact
+    # the repository keeps the file somewhere else than the URL's path (an upload script, an old `main` download):
+    # one file with that name below the revision is it; several are not a guess worth making
+    hits = sorted(p for p in snap.glob("**/" + Path(m["name"]).name) if p.is_file())
+    return hits[0] if len(hits) == 1 else None
+
+
+def take_from_hf_cache(url: str, dst: Path, what=None) -> bool:
+    """`dst` from the hub cache instead of the network.  A hardlink, so a 58 GB model is not stored twice; a copy
+    when the cache is on another filesystem (os.link: EXDEV).  False when the cache does not have that file."""
+    src = hf_cached(url)
+    if src is None:
+        return False
+    part = dst.with_name(dst.name + ".from-hf")
+    part.unlink(missing_ok=True)
+    try:
+        os.link(src, part)                       # follows the symlink into blobs/, so the blob itself is linked
+    except OSError:
+        shutil.copyfile(src, part)
+    part.replace(dst)
+    mark(dst)
+    ok(f"{what or dst.name} taken from the Hugging Face cache ({src})")
+    return True
+
+
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
@@ -750,6 +806,114 @@ def free_gb(path):
     return shutil.disk_usage(path).free / 1e9
 
 
+def same_filesystem(a: Path, b: Path) -> bool:
+    """Whether a hardlink from a to b is possible at all (one st_dev).  A path that is not there yet is judged by the
+    folder it would be created in - on a first run the models folder does not exist, and then a cached model must
+    still count as one that needs no room (#506)."""
+    parents = []
+    for p in (a, b):
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        parents.append(p)
+    try:
+        return os.stat(parents[0]).st_dev == os.stat(parents[1]).st_dev
+    except OSError:
+        return False
+
+
+def bigger_places(need: float, skip: Path) -> list[str]:
+    """The mounted folders with room for `need` GB, most free space first, so the hint can name one instead of only
+    saying "use --models-dir on a bigger drive" (#506).  The conventional places for extra drives: A:..Z: on Windows,
+    /mnt, /media, /Volumes, /run/media elsewhere.  What is mounted and readable is asked of the filesystem itself."""
+    roots = [Path(f"{chr(c)}:\\") for c in range(ord("A"), ord("Z") + 1)] if WIN else \
+        [Path(p) for p in ("/mnt", "/media", "/Volumes", "/run/media")]
+    found = []
+    for root in roots:
+        try:
+            entries = sorted(root.iterdir()) if root.is_dir() else [root]
+        except OSError:
+            continue
+        for d in entries:
+            try:
+                if d == skip or not d.is_dir() or not os.path.ismount(str(d)):
+                    continue
+                free = shutil.disk_usage(d).free / 1e9
+            except OSError:
+                continue
+            if free >= need:
+                found.append((free, str(d)))
+    return [p for _, p in sorted(found, reverse=True)]
+
+
+def family_sizes(family):
+    """The sizes a family offers, in the order the menu lists them."""
+    return [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
+
+
+def in_hf_cache(family, model) -> bool:
+    """Whether every shard of this model is already in the hub cache, at the revision setup pins (#506).  A cached
+    `main` is other bytes and does not count - the same rule as the download itself."""
+    fam = FAMILIES[family]
+    return all(hf_cached(fam["hf"].format(q=model) + fam["file"].format(q=model, i=i))
+               for i in range(1, fam.get("shards", 2) + 1))
+
+
+def cached_sizes(family, models_root=None) -> dict:
+    """The sizes of this family that are already in the hub cache, mapped to whether they can be hardlinked (one
+    filesystem with the models folder - then they need no room on the disk either) or have to be copied there."""
+    out = {}
+    for m in family_sizes(family):
+        if in_hf_cache(family, m):
+            out[m] = bool(models_root) and same_filesystem(hf_hub_cache(), Path(models_root))
+    return out
+
+
+def runs_here(model, ram, vram) -> bool:
+    """Whether this PC can run the model at all - in the low-RAM mode if that is what it needs."""
+    return ram >= MODELS[model]["ram_gb"] or low_ram_fits(model, ram, vram)
+
+
+def cached_pick(order, cached, plain, ram, vram, runs=None):
+    """Which entry to recommend out of `order`: `plain` (the first family, or the size the RAM rule picks) unless a
+    model that is already on the disk could be used instead and this PC can run it (#506).  Recommending, not
+    forcing: it is the default the questions are asked with, and every other choice stays.  `runs` says for a
+    family (an entry that holds several sizes) whether one of its cached sizes fits here."""
+    fits = runs or (lambda n: runs_here(n, ram, vram))
+    if plain in cached and fits(plain):
+        return plain, False
+    for n in order:
+        if n in cached and fits(n):
+            return n, True
+    return plain, False
+
+
+def cached_bytes(shards, fam, model, models_dir, gguf_dir=False) -> float:
+    """What the drive already holds for this model, in GB: the shards and their .part files (#425, a resuming
+    download needs room only for what is missing), and the ones the hub cache hands over without a byte of room
+    (#506: a hardlink needs one filesystem, a copy from another drive needs the bytes again)."""
+    total = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file())
+    if not gguf_dir and any(not (s.exists() and done(s)) for s in shards):
+        if same_filesystem(hf_hub_cache(), models_dir):
+            for s in shards:
+                if s.exists() and done(s):
+                    continue
+                src = hf_cached(fam["hf"].format(q=model) + s.name)
+                if src:
+                    total += src.stat().st_size
+    return total / 1e9
+
+
+def disk_need(model, family, avx512, vision, low_ram, on_disk, have_model=False) -> float:
+    """How much room the model needs on the drive it goes to, in GB: what is still missing of the download, 8 GB
+    beside it, the Q2_0 experts rewrite for the AVX-512 kernel, the image encoder, and - in the low-RAM mode - the
+    experts as their own file, which is a second copy of them on the disk.  `on_disk` is what is already there
+    (cached_bytes), so a model that only has to be fetched is not paid for twice."""
+    rewrite = model == "Q2_0" and avx512 and family == "qwen"
+    to_fetch = 0 if have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
+    return to_fetch + 8 + (40 if rewrite else 0) + (1 if vision != "none" else 0) + \
+        (MODELS[model]["arena_gb"] + 1 if low_ram and not rewrite else 0)
+
+
 # ------------------------------------------------------------------------------------------------ downloads
 def drop_archive(z: Path) -> None:
     """An unpacked or refused engine archive and its .done mark go: a refused one kept them, and every later run
@@ -760,10 +924,13 @@ def drop_archive(z: Path) -> None:
 
 def download(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
-    A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
+    A finished file gets a <name>.done mark, so a later run skips it without asking the server.  A Hugging Face
+    URL is looked up in the local hub cache first (#506) - what `hf download` already fetched is not fetched again."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
+        return
+    if url.startswith(("http://", "https://")) and take_from_hf_cache(url, dst, what):
         return
     if not url.startswith(("http://", "https://")):
         src = Path(url[7:] if url.startswith("file://") else url)
@@ -3101,19 +3268,30 @@ def main() -> int:
     # ---- 2. the questions
     step(2, "your choices")
     fams = list(FAMILIES)
+    models_root = Path(a.models_dir) if not a.gguf_dir else None
+    cached = {f: cached_sizes(f, models_root) for f in fams}
+    cached = {f: d for f, d in cached.items() if d}
+    rec_fam, from_cache = cached_pick(fams, cached, fams[0], ram, gpu["vram_gb"],
+                                      runs=lambda f: any(runs_here(m, ram, gpu["vram_gb"]) for m in cached[f]))
     if a.family:
         family = a.family
     else:
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], "1", a.yes)) - 1]
+            have = cached.get(f, {})
+            mark = f"   [{', '.join(have)}: in your Hugging Face cache already, " \
+                   f"{'no room needed' if all(have.values()) else 'nothing to download'}]" if have else ""
+            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}"
+                + ("   [experimental]" if d.get("experimental") else "") + mark
+                + ("   (recommended: the one you have already)" if f == rec_fam and from_cache else ""))
+        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)],
+                              str(fams.index(rec_fam) + 1), a.yes)) - 1]
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     say()
-    names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
+    names = family_sizes(family)
     if a.model and a.model not in names:
         # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
         elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
@@ -3124,6 +3302,9 @@ def main() -> int:
     for i, m in enumerate(names, 1):
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
+        if m in cached.get(family, {}):            # #506: the download for this one is already paid for
+            fit += f"   <- in your Hugging Face cache: {d['download_gb']:.0f} GB, nothing to download" + \
+                   ("" if cached[family][m] else f" (a copy into {models_root} still needs {d['download_gb']:.0f} GB)")
         if d.get("budget"):
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
@@ -3133,7 +3314,13 @@ def main() -> int:
                    + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
-    model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
+    # #506: a size that is already on the disk is worth more than the RAM rule's order, as long as it fits here
+    rec_name, size_from_cache = cached_pick(names, cached.get(family, {}), names[int(rec) - 1], ram, gpu["vram_gb"])
+    model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
+                                     str(names.index(rec_name) + 1), a.yes)) - 1]
+    if size_from_cache and not a.model and rec_name == model:
+        say(f"  {model} is the size in your Hugging Face cache ({MODELS[model]['download_gb']:.0f} GB): "
+            "nothing to download")
     budget, q4_split = None, False
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
@@ -3317,17 +3504,37 @@ def main() -> int:
         if s.exists() and not done(s) and whole_shard(s):
             mark(s, "whole (checked against its own tensor directory)")
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
-    # #425 (jctaborda): a download that resumes needs room only for what is still missing - the finished shards and
-    # the .part files already on the disk count
-    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
-    to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
-    need = to_fetch + 8 + \
-        (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0) + \
-        (MODELS[model]["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and avx512 and family == "qwen") else 0)
-    if free_gb(models_dir) < need:
-        fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
-             (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""),
-             "use --models-dir on a bigger drive")
+    # #425 (jctaborda) + #506: room for what is still missing - the finished shards, the .part files and the hub cache
+    # on this filesystem are already on the drive and are not paid for again
+    free_here = free_gb(models_dir)
+    on_disk = cached_bytes(shards, fam, model, models_dir, a.gguf_dir)
+    need = disk_need(model, family, avx512, vision, low_ram, on_disk, have_model)
+    if free_here < need:
+        places = bigger_places(need, models_dir)
+        cached_gb = on_disk if not a.gguf_dir else 0
+        where = f", {cached_gb:.0f} GB of it is already in your Hugging Face cache and needs no room" \
+            if cached_gb >= 1 else ""
+        already = f" ({on_disk - cached_gb:.0f} GB of the model is already there)" \
+            if on_disk - cached_gb >= 1 and not have_model else ""
+        if places:
+            hint = f"--models-dir {places[0]} has room for it"
+            if len(places) > 1:
+                hint += f" (or {', '.join(places[1:4])})"
+        else:
+            hint = "use --models-dir on a bigger drive"
+        if not cached_gb:
+            hint += "; --gguf-dir <folder> if you have the files already"
+        # #506: a model that IS on this PC already beats any hint about space - name it, with the command for it
+        for f, have in sorted(cached.items()):
+            for m, linked in have.items():
+                if f == family and m == model:
+                    continue
+                cost = disk_need(m, f, avx512, vision, low_ram, MODELS[m]["download_gb"] if linked else 0)
+                hint = f"--family {f} --model {m}: {MODELS[m]['download_gb']:.0f} GB, already in your Hugging " \
+                       f"Face cache, needs {cost:.0f} GB" + (hint and f"  |  to get {model}: {hint}")
+                break
+        fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB, {free_here:.0f} GB free" + where +
+             already, hint)
 
     # ---- 3. python packages
     step(3, "Python packages")
@@ -3376,6 +3583,8 @@ def main() -> int:
             say(f"  The model files go in {models_dir}")
             say(f"  Files you already have: put them here with their original names ({', '.join(missing)}), or use "
                 "--gguf-dir <their folder>.")
+            if hf_hub_cache().is_dir():              # #506: `hf download` keeps them here, and setup takes them from here
+                say(f"  Already in your Hugging Face cache: taken from {hf_hub_cache()} (nothing is downloaded again)")
             if hf_endpoint() != HF_DEFAULT:
                 say(f"  Downloading from {hf_endpoint()} (HF_ENDPOINT)")
         for s in shards:

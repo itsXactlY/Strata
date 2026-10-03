@@ -207,5 +207,13 @@ point setup at them with `--gguf-dir`. To let setup download from a Hugging Face
 first (Windows: `set HF_ENDPOINT=https://hf-mirror.com`, Linux: `export HF_ENDPOINT=https://hf-mirror.com`): the same
 pinned revisions and checks apply, and the MTP draft layer comes from there too.
 
+**Files you already have in the Hugging Face cache (#506):** nothing to do - setup looks in the hub cache
+(`$HF_HUB_CACHE`, else `$HF_HOME\hub`, else `~\.cache\huggingface\hub`; the same order `huggingface_hub` reads) before
+it downloads, and takes the file from there if that repository's **pinned revision** is cached there. So a model you
+fetched with `hf download`, `huggingface-cli` or Unsloth is not fetched again (58 GB for the Coder's IQ1_M, 111 GB for
+the Unsloth Q4), it works with no internet at all, and it is hardlinked, not copied, so it does not take the disk
+twice. Only the pinned revision counts: a cached `main` is another revision's bytes and is downloaded as before. If
+your cache is elsewhere, point `HF_HUB_CACHE` at it, or use `--gguf-dir`.
+
 On Linux the same options go to `./setup.sh`. `START-HERE.bat --help` lists them all. The server's own settings
 (sharing the GPU with games, MCP tools, CORS, API keys, the API itself) are in the [details](DETAILS.md#using-it).
