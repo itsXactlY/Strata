@@ -204,8 +204,18 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
 namespace {
 // After the authoritative pools were rewritten: the VRAM slots of a streamed state still hold the outgoing
 // conversation, so resolve must refill them before any attention reads (shared by restore and direct copy).
+// TAPE: the host mirror and the claim/ids replay state describe the outgoing conversation too.
 bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 1) {
+        strata::kernels::kv_stream_reset(st.map, nullptr);
+        strata::kernels::kv_mirror_reset(st.mirror, st.n_pages, st.n_slots);
+        if (st.claim_host != nullptr) st.claim_host[0] = st.claim_host[1] = st.claim_host[2] = 0;
+        st.last_valid = false;
+        st.last_n_q = 0;
+        st.last_cap = 0;
+        st.last_ids.clear();
+        st.last_steps.clear();
+    }
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
