@@ -208,7 +208,16 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
             })) return false;
     // VRAM slots still contain the outgoing conversation. Resolve must refill
     // them from the restored authoritative pools before any attention reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 1) {
+        strata::kernels::kv_stream_reset(st.map, nullptr);
+        strata::kernels::kv_mirror_reset(st.mirror, st.n_pages, st.n_slots);
+        if (st.claim_host != nullptr) st.claim_host[0] = st.claim_host[1] = st.claim_host[2] = 0;
+        st.last_valid = false;
+        st.last_n_q = 0;
+        st.last_cap = 0;
+        st.last_ids.clear();
+        st.last_steps.clear();
+    }
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
         shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;

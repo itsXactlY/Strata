@@ -54,6 +54,7 @@ struct KvStreamMap {
     int32_t* ctl = nullptr;         ///< kKvCtlInts: epoch, hand, misses of the last call, overflow, u64 counters
     int32_t* miss_block = nullptr;  ///< (n_slots,)
     int32_t* miss_slot = nullptr;   ///< (n_slots,)
+    int32_t* claim = nullptr;       ///< mapped host, kKvClaimInts: pairs, epoch, hand, then (block, slot) pairs
     int64_t n_blocks = 0;
     int64_t n_slots = 0;
 };
@@ -71,6 +72,17 @@ void kv_stream_reset(const KvStreamMap& m, void* stream);
 void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream);
+
+/// The eager prefetch pair (docs/strata-tape-benefit.md).  `claim` is the mapped-host table the verifier fills
+/// with the (block, slot) pairs its mirror of resolve picked for the NEXT layer: [0] pairs, [1] epoch, [2] hand,
+/// [3..] pairs.  `qsa_kv_fetch` copies them into their slots on the copy stream (issue it right after the mirror
+/// ran); `qsa_kv_claim` applies the pairs inside the next graph on the compute stream.  The host must order the
+/// graph launch with an event edge (record on the copy stream, wait on the compute stream) so claim and attention
+/// see the fetches.  Capturable (claim).  `claim[1] == 0` disables both.
+inline constexpr int kKvClaimInts = 4 + 2 * 4096;   ///< pairs up to the resolve's own bound (n_slots)
+void qsa_kv_fetch(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
+                  const QsaShapes& s, void* stream);
+void qsa_kv_claim(const KvStreamMap& m, void* stream);
 
 /// The static ring table `block -> block % n_slots`.
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream);

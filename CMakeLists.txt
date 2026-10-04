@@ -666,6 +666,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(kv_stream_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
 
+  # TAPE prefetch contract (phase 1): host mirror vs GPU map, claim+resolve lockstep (GPU, synthetic).
+  add_executable(kv_stream_verify src/kernels/kv_stream_verify.cpp)
+  target_include_directories(kv_stream_verify PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_stream_verify PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_stream_verify COMMAND kv_stream_verify)
+
   # PR #120: the hybrid K8V4 KV (INT8 K + rotated Q4_0 V) vs host references (GPU, synthetic, no model).
   add_executable(kv_hybrid_parity src/kernels/kv_hybrid_parity.cpp)
   target_include_directories(kv_hybrid_parity PRIVATE ${_strata_gpu_include_directories})
@@ -1042,6 +1048,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+
+  # TAPE parity gate (plan .daedalus/PLAN-strata-tape-benefit.md, phase 0):
+  # fork's plan layer ported unmodified; the fork's full test vectors run as-is.
+  add_executable(kv_tape_parity src/kernels/kv_tape_parity.cpp src/kernels/kv_tape.cpp)
+  target_link_libraries(kv_tape_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME kv_tape_parity COMMAND kv_tape_parity)
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)

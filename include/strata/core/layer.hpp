@@ -37,6 +37,7 @@
 
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/kv_stream_host.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 
@@ -44,6 +45,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -233,6 +235,33 @@ struct QsaState {
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
+
+    /// TAPE HOST PREFETCH (kv_stream_host.hpp). Only allocated when kv_mode == 1. The mirror replays
+    /// resolve on the CPU so the host can claim the next resolve's slots and issue fetches on `kv_copy`
+    /// while the compute stream is busy. `claim_host` is the CPU pointer of `map.claim` (mapped pinned;
+    /// the device view is what fetch/claim read). The prediction state is `mutable` because
+    /// `qsa_kv_resolve` takes a `const QsaState&` (it does not reseat pointers) but the mirror is a
+    /// cache that legitimately mutates. OFF by default: set STRATA_KV_TAPE_HOST=1 to enable the host
+    /// path on uncaptured streams. Captured graphs always take plain resolve; claim stays at
+    /// claim[1]==0 there (the documented disable).
+    mutable strata::kernels::KvStreamMirror mirror;
+    int32_t* claim_host = nullptr;   ///< CPU view of map.claim; null when the host path is unavailable
+    void* kv_copy = nullptr;         ///< cudaStream_t: the prefetch fetch stream
+    void* kv_fetch_done = nullptr;   ///< cudaEvent_t: copy-stream edge before claim+resolve
+    /// Pinned staging the host path D2H's the selection into and writes miss lists through. Fixed
+    /// addresses (the copy stream and any future graph node would bake a pointer, not a value).
+    int32_t* host_ids = nullptr;     ///< (host_ids_cap * host_cap)
+    int32_t* host_steps = nullptr;   ///< (host_ids_cap * kStepCount)
+    int32_t* host_miss_block = nullptr;  ///< (n_slots)
+    int32_t* host_miss_slot = nullptr;   ///< (n_slots)
+    int64_t host_ids_cap = 0;        ///< selection rows the staging holds (max n_q)
+    int64_t host_cap = 0;            ///< selection stride the staging was sized for
+    /// Previous call's selection, stashed for the next call's cross-token prefetch. Vectors, not
+    /// pinned: only the host mirror reads them. `last_cap` is the ids stride they were saved with.
+    mutable std::vector<int32_t> last_ids, last_steps;
+    mutable int64_t last_n_q = 0;
+    mutable int64_t last_cap = 0;
+    mutable bool last_valid = false;
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence

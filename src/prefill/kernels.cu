@@ -531,11 +531,13 @@ __global__ void swiglu_pair_kernel(const float* __restrict__ g, const float* __r
 }
 __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32_t* __restrict__ src,
                                      uint16_t* __restrict__ dst, int64_t n, int64_t width) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // one uint4 (8 bf16)
-    const int64_t per = width / 8;
-    if (i >= n * per) return;
-    const int64_t r = i / per, j = i % per;
-    reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
+    const int64_t total = n * width;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t r = i / width;
+        const int64_t c = i - r * width;
+        dst[i] = x[(int64_t) src[r] * width + c];
+    }
 }
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
@@ -688,27 +690,32 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
 
 void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t* xn16, int64_t T, void* stream,
              uint16_t* xn16_lo) {
+    if (T <= 0) return;
     gr_norm_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, xn, xn16, xn16_lo);
     check("gr_norm");
 }
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
                 uint16_t* xn16_lo) {
+    if (T <= 0) return;
     gr_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, w_norm, eps, rs, xn16, xn16_lo);
     check("gr_norm_rs");
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+    if (T <= 0) return;
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                           mixed_h, mixed16_lo);
     check("gr_mix_r");
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo) {
+    if (T <= 0) return;
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16, xn16_lo);
     check("gr_write_norm_rs");
 }
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
+    if (T <= 0) return;
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, lo16_lo, T * LR);
     check("gr_silu");
 }
@@ -718,18 +725,22 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
     check("gr_mix");
 }
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
+    if (T <= 0) return;
     gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T);
     check("gr_write");
 }
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
+    if (T <= 0) return;
     gr_broadcast_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(e, R, T);
     check("gr_broadcast");
 }
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream) {
+    if (T <= 0) return;
     gdn_gates_kernel<<<blocks_for(T * HV), 256, 0, (cudaStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
+    if (T <= 0) return;
     static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
     if (serial || T <= CONV_TILE) {
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
@@ -743,6 +754,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
+    if (T <= 0) return;
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
     if (serial || T <= 0) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
@@ -757,6 +769,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     check("gdn_recurrence");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    if (T <= 0) return;
     if (n_expert == 512)
         route_kernel<16><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
     else if (n_expert == 256)
@@ -779,6 +792,7 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
     check("swiglu_interleaved");
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream) {
+    if (n <= 0) return;
     swiglu_pair_kernel<<<blocks_for(n * 640), 256, 0, (cudaStream_t) stream>>>(g, u, h16, n);
     check("swiglu_pair");
 }
@@ -795,22 +809,24 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     check("copy_i32");
 }
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
-    if (n <= 0) return;
-    gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
+    if (n <= 0 || width <= 0) return;
+    gather_rows16_kernel<<<blocks_for(n * width), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
+    if (T <= 0) return;
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
     check("moe_combine");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
-    if (rows <= 0) return;
+    if (rows <= 0 || cols <= 0) return;
     rms_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, ld, eps);
     check("rms_rows");
 }
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
           const strata::kernels::RopeScaling& scaling, void* stream) {
+    if (T <= 0 || heads <= 0) return;
     // The engine validates the resolved config at startup with the same rule (generate.cpp), so this only
     // fires for a caller that bypassed it; the prompt path has no error return here, so it stops the process.
     if (const char* why = strata::kernels::rope_scaling_invalid(scaling)) {
@@ -831,10 +847,12 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     check("rope");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
+    if (T <= 0) return;
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream) {
+    if (T <= 0) return;
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T);
     check("gate_attn");
 }

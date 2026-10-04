@@ -600,6 +600,57 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
         st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
         st.map.ctl = c.take<int32_t>((uint64_t) strata::kernels::kKvCtlInts);
+        // TAPE prefetch claim table: mapped host; claim[1]==0 disables fetch/claim until a host path fills it.
+        {
+            void* ch = nullptr;
+            void* cd = nullptr;
+            if (cudaHostAlloc(&ch, (size_t) strata::kernels::kKvClaimInts * 4,
+                              cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer(&cd, ch, 0) != cudaSuccess) {
+                return 0;
+            }
+            std::memset(ch, 0, (size_t) strata::kernels::kKvClaimInts * 4);
+            st.map.claim = (int32_t*) cd;
+            st.claim_host = (int32_t*) ch;
+        }
+        // Host-path staging: the mirror's D2H of ids/steps, the miss lists, the copy stream and the
+        // fetch-done event. Sized for one verify window's worth of queries at the engine's widest
+        // selection (qsa_selection_width(kTopkMaxCells)); a caller past that falls back to plain resolve.
+        {
+            const int64_t max_cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+            const int64_t rows = 64;   // verify windows are 8 queries; 64 leaves headroom
+            auto pin = [](void** p, size_t bytes) {
+                return cudaHostAlloc(p, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+            };
+            void* hid = nullptr;
+            void* hst = nullptr;
+            void* hmb = nullptr;
+            void* hms = nullptr;
+            if (!pin(&hid, (size_t) rows * max_cap * 4) || !pin(&hst, (size_t) rows * strata::kernels::kStepCount * 4) ||
+                !pin(&hmb, (size_t) p.slots * 4) || !pin(&hms, (size_t) p.slots * 4)) {
+                return 0;
+            }
+            std::memset(hid, 0, (size_t) rows * max_cap * 4);
+            std::memset(hst, 0, (size_t) rows * strata::kernels::kStepCount * 4);
+            std::memset(hmb, 0, (size_t) p.slots * 4);
+            std::memset(hms, 0, (size_t) p.slots * 4);
+            st.host_ids = (int32_t*) hid;
+            st.host_steps = (int32_t*) hst;
+            st.host_miss_block = (int32_t*) hmb;
+            st.host_miss_slot = (int32_t*) hms;
+            st.host_ids_cap = rows;
+            st.host_cap = max_cap;
+            strata::kernels::kv_mirror_reset(st.mirror, pages, p.slots);
+            st.last_valid = false;
+            st.last_n_q = 0;
+            st.last_cap = 0;
+            st.last_ids.clear();
+            st.last_steps.clear();
+            if (cudaStreamCreate((cudaStream_t*) &st.kv_copy) != cudaSuccess ||
+                cudaEventCreate((cudaEvent_t*) &st.kv_fetch_done) != cudaSuccess) {
+                return 0;
+            }
+        }
     }
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
@@ -707,7 +758,16 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
     // carries the unwritten cells past the end, which nothing reads.
-    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
+    if (st.kv_mode == 1) {
+        strata::kernels::kv_stream_reset(st.map, stream);
+        strata::kernels::kv_mirror_reset(st.mirror, st.n_pages, st.n_slots);
+        if (st.claim_host != nullptr) st.claim_host[0] = st.claim_host[1] = st.claim_host[2] = 0;
+        st.last_valid = false;
+        st.last_n_q = 0;
+        st.last_cap = 0;
+        st.last_ids.clear();
+        st.last_steps.clear();
+    }
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
@@ -726,8 +786,96 @@ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream) {
     if (st.kv_mode != 1) return;
-    strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q, cap,
-                                       qsa_shapes(g), stream);
+    cudaStream_t cs = (cudaStream_t) stream;
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    const bool capturing = cudaStreamIsCapturing(cs, &cap_st) == cudaSuccess &&
+                           cap_st != cudaStreamCaptureStatusNone;
+    // Host-assisted prefetch (kv_stream_host.hpp's contract, gated by kv_stream_verify). OFF by
+    // default: the engine's resolve is the plain device path, bit-identical to before the wiring.
+    // STRATA_KV_TAPE_HOST=1 turns the host path on for uncaptured streams only; captured graphs
+    // always take the plain resolve (claim[1]==0 keeps fetch/claim disabled there).
+    static const bool tape_on = std::getenv("STRATA_KV_TAPE_HOST") != nullptr;
+    const bool host_path = tape_on && !capturing && st.claim_host != nullptr && st.kv_copy != nullptr &&
+                           st.host_ids != nullptr && st.host_miss_block != nullptr && n_q > 0 &&
+                           n_q <= st.host_ids_cap && cap > 0 && cap <= st.host_cap;
+    const strata::kernels::QsaShapes s = qsa_shapes(g);
+    if (!host_path) {
+        strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q,
+                                           cap, s, stream);
+        return;
+    }
+    const int page_size = (int) s.page_size;
+    cudaStream_t copy = (cudaStream_t) st.kv_copy;
+    int32_t* claim_h = st.claim_host;
+
+    // 1. PREFETCH FROM THE PREVIOUS CALL'S SELECTION (temporal locality). A speculative resolve on a
+    //    mirror copy picks the pairs this resolve would re-fetch; the copy stream starts copying them
+    //    while step 2's D2H runs. Only non-resident blocks appear as misses, so a still-resident
+    //    predictor target is never claimed (no ctl[3] tripwire).
+    if (st.last_valid && st.last_n_q == n_q && st.last_cap == cap && !st.last_ids.empty()) {
+        strata::kernels::KvStreamMirror pred = st.mirror;
+        const int32_t placed = strata::kernels::kv_mirror_resolve(
+            pred, st.last_ids.data(), st.last_steps.data(), (int) n_q, (int) st.last_cap, page_size,
+            st.host_miss_block, st.host_miss_slot);
+        if (placed > 0) {
+            claim_h[0] = placed;
+            claim_h[1] = st.mirror.epoch;
+            claim_h[2] = st.mirror.hand;
+            for (int32_t i = 0; i < placed; ++i) {
+                claim_h[3 + 2 * i] = st.host_miss_block[i];
+                claim_h[4 + 2 * i] = st.host_miss_slot[i];
+            }
+            strata::kernels::qsa_kv_fetch(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), s, copy);
+        } else {
+            claim_h[0] = claim_h[1] = claim_h[2] = 0;
+        }
+    } else {
+        claim_h[0] = claim_h[1] = claim_h[2] = 0;
+    }
+
+    // 2. D2H this call's selection into pinned staging. The sync is what makes the mirror's replay
+    //    possible; the bytes are small (n_q x cap int32) and the copy stream may still be fetching.
+    const size_t ids_bytes = (size_t) n_q * (size_t) cap * 4;
+    const size_t st_bytes = (size_t) n_q * (size_t) strata::kernels::kStepCount * 4;
+    if (cudaMemcpyAsync(st.host_ids, ids, ids_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+        cudaMemcpyAsync(st.host_steps, steps, st_bytes, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
+        cudaStreamSynchronize(cs) != cudaSuccess) {
+        claim_h[0] = claim_h[1] = claim_h[2] = 0;
+        st.last_valid = false;
+        strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q,
+                                           cap, s, stream);
+        return;
+    }
+
+    // 3. Event edge: claim and resolve must see the copy stream's fetches (kv_stream.hpp's protocol).
+    if (claim_h[1] != 0) {
+        cudaEvent_t ev = (cudaEvent_t) st.kv_fetch_done;
+        cudaEventRecord(ev, copy);
+        cudaStreamWaitEvent(cs, ev, 0);
+        strata::kernels::qsa_kv_claim(st.map, cs);
+    }
+
+    // 4. Device resolve. Claimed blocks hit (already resident); any prediction miss takes the normal
+    //    miss path, so a bad predictor costs nothing but the wasted fetch.
+    strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), st.host_ids,
+                                       st.host_steps, n_q, cap, s, cs);
+
+    // 5. Mirror: adopt the claim, then replay this resolve - the maps stay equal, which is what
+    //    kv_stream_verify's prefetch contract checks after every layer.
+    std::vector<int32_t> claim_copy((size_t) strata::kernels::kKvClaimInts);
+    std::memcpy(claim_copy.data(), claim_h, (size_t) strata::kernels::kKvClaimInts * 4);
+    strata::kernels::kv_mirror_claim(st.mirror, claim_copy.data());
+    strata::kernels::kv_mirror_resolve(st.mirror, st.host_ids, st.host_steps, (int) n_q, (int) cap, page_size,
+                                       st.host_miss_block, st.host_miss_slot);
+
+    // 6. Stash this selection for the next call; clear claim so a later captured claim_kernel cannot
+    //    adopt stale pairs (the two paths must not interleave on one state).
+    st.last_ids.assign(st.host_ids, st.host_ids + (size_t) n_q * (size_t) cap);
+    st.last_steps.assign(st.host_steps, st.host_steps + (size_t) n_q * (size_t) strata::kernels::kStepCount);
+    st.last_n_q = n_q;
+    st.last_cap = cap;
+    st.last_valid = true;
+    claim_h[0] = claim_h[1] = claim_h[2] = 0;
 }
 
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;

@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_runtime.h>
 
@@ -54,6 +55,10 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
     return r;
 }
 
+// A thread's per-sweep lookup list for the deterministic miss order: one thread cannot see more than
+// ceil(width/RT) <= KV_MAXL distinct blocks of one query, so its list fits in shared memory.
+constexpr int KV_MAXL = 8;
+
 // Block-wide exclusive prefix sum of one int per thread (RT threads); `total` is the sum over the block.
 __device__ int block_scan(int v, int* warp_sums, int& total) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
@@ -83,12 +88,18 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                                                      const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
+    __shared__ int s_list[RT * KV_MAXL];   // per-thread lookup lists for the deterministic miss order
     const int epoch = m.ctl[0] + 1;
     if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; }
     __syncthreads();
-    // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
+    // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2).
+    //    The miss order is deterministic: each thread keeps its own list in sweep order, a block scan
+    //    places the lists back to back, so the host mirror of this kernel sees the same miss order.
     int lookups = 0;
     for (int q = 0; q < n_q; ++q) {
+        const int base = s_nmiss;
+        const int t0 = threadIdx.x * KV_MAXL;
+        int local = 0;
         const int width = steps[q * kStepCount + kStepWidth];
         const int32_t* qi = ids + (long long) q * cap;
         for (int i = threadIdx.x; i < width; i += RT) {
@@ -100,9 +111,16 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                 m.slot_stamp[sl] = epoch;
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                if (local < KV_MAXL) s_list[t0 + local] = b;
+                ++local;
             }
         }
+        if (local > KV_MAXL) { if (threadIdx.x == 0) m.ctl[3] = 1; local = KV_MAXL; }   // tripwire, see host guard
+        int total = 0;
+        const int excl = block_scan(local, warp_sums, total);
+        for (int k = 0; k < local; ++k) m.miss_block[base + excl + k] = s_list[t0 + k];
+        if (threadIdx.x == 0) s_nmiss = base + total;
+        __syncthreads();
     }
     atomicAdd(&s_lookups, lookups);
     __syncthreads();
@@ -170,6 +188,42 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
     }
 }
 
+// The eager prefetch pair.  The verifier fills a mapped-host claim table between graph layers and issues
+// fetch_kernel on the copy stream right away; before the NEXT graph launches on the compute stream the host
+// records an event on the copy stream and makes the compute stream wait for it, so claim and attention see
+// the fetches by a real stream edge - no spin.  A slot a pair targets is not read by the attention of that
+// layer: it is a victim of the NEXT resolve, whose block is not in that selection, so the fetch cannot race
+// with a reader.  claim[1] == 0 means prefetch is off and claim is a no-op.
+// Layout: [0] pair count, [1] epoch, [2] hand, [3..] (block, slot) pairs.
+__global__ void fetch_kernel(KvStreamMap m, Runs r, const int32_t* __restrict__ claim) {
+    const int need = claim[0];
+    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+        const long long b = claim[3 + 2 * k], sl = claim[4 + 2 * k];
+        for (int a = 0; a < r.n; ++a) {
+            const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
+            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
+            for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
+        }
+    }
+}
+
+__global__ void claim_kernel(KvStreamMap m, const int32_t* __restrict__ claim) {
+    const int epoch = claim[1];
+    if (epoch == 0) return;
+    const int n = claim[0];
+    for (int k = threadIdx.x; k < n; k += blockDim.x) {
+        const int b = claim[3 + 2 * k], sl = claim[4 + 2 * k];
+        if (m.page_table[b] != -1) { m.ctl[3] = 1; continue; }   // mirror drift: tripwire, the window rejects
+        const int old = m.slot_block[sl];
+        if (old >= 0) m.page_table[old] = -1;
+        m.slot_block[sl] = b;
+        m.slot_stamp[sl] = epoch;
+        m.slot_ref[sl] = 1;
+        m.page_table[b] = sl;
+    }
+    if (threadIdx.x == 0) { m.ctl[0] = epoch; m.ctl[1] = claim[2]; }
+}
+
 __global__ void reset_kernel(KvStreamMap m) {
     const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
     for (long long i = i0; i < m.n_blocks; i += st) m.page_table[i] = -1;
@@ -217,10 +271,31 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
     }
+    // the host mirror of resolve keeps its miss list in the claim table; the kernel's list is bounded by
+    // ceil(cap/RT) per thread, so a cap past RT * KV_MAXL would overflow it.  The engine's cap is 2,051.
+    if (cap > (int64_t) RT * KV_MAXL) {
+        std::fprintf(stderr, "kv_stream: selection width %lld exceeds the resolve miss list (%d)\n",
+                     (long long) cap, RT * KV_MAXL);
+        std::exit(1);
+    }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
     copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
+}
+
+// The eager prefetch pair.  fetch copies the claim table's blocks into their slots on the given (copy) stream;
+// claim applies the pairs inside the next graph on the compute stream.  The host orders them with an event edge
+// (record on the copy stream, wait on the compute stream) before the graph launch.
+void qsa_kv_fetch(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
+                  const QsaShapes& s, void* stream) {
+    fetch_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s), m.claim);
+    check("kv fetch");
+}
+
+void qsa_kv_claim(const KvStreamMap& m, void* stream) {
+    claim_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, m.claim);
+    check("kv claim");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
