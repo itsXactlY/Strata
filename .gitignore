@@ -64,3 +64,5 @@ build-vision-cuda12.bat
 
 # local Windows HIP packaging output
 dist-hip/
+.bak/
+.notes/
