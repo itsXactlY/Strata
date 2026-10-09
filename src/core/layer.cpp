@@ -487,6 +487,24 @@ namespace {
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
 
+/// STRATA_KV_TAPE_DEBUG=1: why the host prefetch path was or was not taken, per qsa_kv_resolve call.
+/// A captured graph runs the kernels qsa_kv_resolve recorded at CAPTURE time; the host code below never
+/// executes again, so `calls` staying far below the token count is itself the proof that the host path
+/// is unreachable there.
+struct TapeDebug {
+    long long calls = 0, mode0 = 0, host = 0;
+    long long no_env = 0, capturing = 0, no_claim = 0, no_copy = 0, no_stage = 0, nq0 = 0, nq_big = 0, cap_big = 0;
+    ~TapeDebug() {
+        if (std::getenv("STRATA_KV_TAPE_DEBUG") == nullptr) return;
+        std::fprintf(stderr,
+                     "[tape-debug] qsa_kv_resolve: calls=%lld host_path=%lld kv_mode0=%lld | off: no_env=%lld "
+                     "capturing=%lld no_claim_host=%lld no_kv_copy=%lld no_staging=%lld n_q<=0=%lld "
+                     "n_q>host_ids_cap=%lld cap>host_cap=%lld\n",
+                     calls, host, mode0, no_env, capturing, no_claim, no_copy, no_stage, nq0, nq_big, cap_big);
+    }
+};
+TapeDebug g_tape_debug;
+
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
 struct KvPlan {
     int mode = 0;
@@ -785,7 +803,8 @@ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
 
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream) {
-    if (st.kv_mode != 1) return;
+    if (st.kv_mode != 1) { ++g_tape_debug.calls; ++g_tape_debug.mode0; return; }
+    ++g_tape_debug.calls;
     cudaStream_t cs = (cudaStream_t) stream;
     cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
     const bool capturing = cudaStreamIsCapturing(cs, &cap_st) == cudaSuccess &&
@@ -798,6 +817,15 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
     const bool host_path = tape_on && !capturing && st.claim_host != nullptr && st.kv_copy != nullptr &&
                            st.host_ids != nullptr && st.host_miss_block != nullptr && n_q > 0 &&
                            n_q <= st.host_ids_cap && cap > 0 && cap <= st.host_cap;
+    if (!tape_on) ++g_tape_debug.no_env;
+    else if (capturing) ++g_tape_debug.capturing;
+    else if (st.claim_host == nullptr) ++g_tape_debug.no_claim;
+    else if (st.kv_copy == nullptr) ++g_tape_debug.no_copy;
+    else if (st.host_ids == nullptr || st.host_miss_block == nullptr) ++g_tape_debug.no_stage;
+    else if (n_q <= 0) ++g_tape_debug.nq0;
+    else if (n_q > st.host_ids_cap) ++g_tape_debug.nq_big;
+    else if (cap <= 0 || cap > st.host_cap) ++g_tape_debug.cap_big;
+    if (host_path) ++g_tape_debug.host;
     const strata::kernels::QsaShapes s = qsa_shapes(g);
     if (!host_path) {
         strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q,
