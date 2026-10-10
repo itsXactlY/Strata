@@ -235,6 +235,32 @@ __global__ void reset_kernel(KvStreamMap m) {
     if (i0 < kKvCtlInts) m.ctl[i0] = 0;
 }
 
+// A rebase drops the epoch's history: every block before the cut stops being
+// resident, exactly as reset_kernel does for the whole map, but only over a
+// prefix. Slots holding a retired block are freed so the residency clock can
+// reuse them, and the counter reports how many pages were still resident (the
+// difference matters: a page already streamed out has nothing to release).
+__global__ void eject_kernel(KvStreamMap m, long long cut_blocks, long long* retired) {
+    const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
+    long long n = 0;
+    for (long long b = i0; b < m.n_blocks && b < cut_blocks; b += st) {
+        if (m.page_table[b] != -1) ++n;
+        m.page_table[b] = -1;
+    }
+    // Free the slots whose block was just retired. Scanned over slots, not blocks:
+    // a block may have been streamed out already, so only the slot side knows
+    // which physical pages are still occupied by the prefix.
+    for (long long s = i0; s < m.n_slots; s += st) {
+        const long long b = m.slot_block[s];
+        if (b >= 0 && b < cut_blocks) {
+            m.slot_block[s] = -1;
+            m.slot_stamp[s] = -1;
+            m.slot_ref[s] = 0;
+        }
+    }
+    if (i0 == 0 && retired != nullptr) *retired = n;
+}
+
 __global__ void ring_kernel(int32_t* table, long long n_blocks, long long n_slots) {
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n_blocks;
          i += (long long) gridDim.x * blockDim.x)
@@ -253,6 +279,21 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
     reset_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m);
     check("reset");
+}
+
+long long kv_stream_eject(const KvStreamMap& m, long long cut_blocks, void* stream) {
+    if (cut_blocks <= 0) return 0;
+    const long long capped = cut_blocks < m.n_blocks ? cut_blocks : m.n_blocks;
+    long long* retired = nullptr;
+    if (cudaMalloc(&retired, sizeof(long long)) != cudaSuccess) return -1;
+    cudaMemsetAsync(retired, 0, sizeof(long long), (cudaStream_t) stream);
+    eject_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m, capped, retired);
+    check("eject");
+    long long n = 0;
+    cudaMemcpy(&n, retired, sizeof(long long), cudaMemcpyDeviceToHost);
+    cudaStreamSynchronize((cudaStream_t) stream);
+    cudaFree(retired);
+    return n;
 }
 
 void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,

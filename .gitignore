@@ -34,7 +34,13 @@ td.log
 /mtp/
 /run-*.bat
 /run-*.sh
+# The daemon-facing run configs carry absolute paths to this machine's model files
+# and scratch dirs, so they stay untracked. strata-daedalus-v2.json is the one
+# exception: it is the reference configuration the endpoint is tuned to, and the
+# numbers in it (context 86000, kv-resident 32768, vram-reserve 1400, slots 2)
+# are what the tuning in docs/DETAILS.md refers to.
 /strata-*.json
+!/strata-daedalus-v2.json
 /strata-*.log
 /build-strata.bat
 /.strata-mcp/

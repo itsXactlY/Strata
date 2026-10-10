@@ -24,6 +24,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/kv_eject.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
@@ -4842,6 +4843,37 @@ int main(int argc, char** argv) {
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
                 save_profile("periodic");
             if (line == "QUIT") break;
+            // EJECT <cut_cells>: a rebase replaced the history under the live conversation, so the cells
+            // before <cut_cells> belong to an epoch that no longer exists. Retire them on the device and
+            // hand the host bytes back to the allocator, so the tail stands alone and the prefix is gone
+            // rather than merely unreachable. The cut is validated against the live write position below:
+            // releasing a cell the current conversation still needs would corrupt the step in flight.
+            if (line.rfind("EJECT ", 0) == 0) {
+                const long long cut = std::strtoll(line.c_str() + 6, nullptr, 10);
+                const long long written = (long long) live.size();
+                if (cut <= 0) {
+                    std::printf("OK EJECT 0\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (cut > written) {
+                    std::printf("ERR EJECT cut %lld is ahead of the live position %lld\n", cut, written);
+                    std::fflush(stdout);
+                    continue;
+                }
+                long long pages = 0, released = 0, pinned = 0;
+                for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+                    strata::core::EjectReport r = strata::core::kv_eject_before(
+                        ss.qsa_states[ss.qsa_ord0 + j], g, cut, written, main_cs);
+                    if (j == 0) pages = r.pages_ejected;
+                    released += (long long) (r.bytes_released / (1u << 20));
+                    pinned += (long long) (r.bytes_locked / (1u << 20));
+                }
+                std::printf("OK EJECT %lld pages %lld released_mib %lld pinned_mib %lld\n",
+                            cut, pages, released, pinned);
+                std::fflush(stdout);
+                continue;
+            }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }

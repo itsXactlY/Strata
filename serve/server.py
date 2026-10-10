@@ -497,6 +497,41 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def kv_eject(self, cut_cells):
+        """Tell the engine that the history before `cut_cells` is gone (a rebase).
+
+        The engine evicts those KV cells on the device and hands the host bytes back to the allocator,
+        so the surviving tail stands alone and the dropped prefix is not left resident. Synchronous: the
+        caller (Daedalus, at the rebase boundary) needs the prefix gone before it renders the next epoch,
+        or the tape would still match the old bytes.
+        """
+        if getattr(self, "proc", None) is None:
+            return None
+        try:
+            self.proc.stdin.write(f"EJECT {int(cut_cells)}\n")
+            self.proc.stdin.flush()
+        except OSError:
+            return None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                line = self.lines.get(timeout=0.5)
+            except Exception:
+                continue
+            if not line:
+                continue
+            text = line if isinstance(line, str) else str(line)
+            if text.startswith("OK EJECT") or text.startswith("ERR EJECT"):
+                parts = text.split()
+                def _int(i, d=0):
+                    try:
+                        return int(parts[i])
+                    except Exception:
+                        return d
+                return {"ok": text.startswith("OK"), "raw": text,
+                        "pages": _int(2), "released_mib": _int(4), "pinned_mib": _int(6)}
+        return {"ok": False, "raw": "timeout"}
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -2220,6 +2255,8 @@ def make_handler(svc: Service):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/kv/eject":
+                    self._kv_eject(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
@@ -2353,6 +2390,27 @@ def make_handler(svc: Service):
                     yield item
             finally:
                 items.close()
+
+        def _kv_eject(self, req):
+            """POST /v1/kv/eject {"cut_cells": N} - a rebase replaced the history under the live
+            conversation. The engine evicts the cells before N and hands the host bytes back to the
+            allocator, so the surviving tail stands alone and the dropped prefix is not left resident
+            (which is what let it sit in swap). Synchronous with the rebase that triggered it."""
+            if not svc.loaded():
+                self._json(503, {"error": {"message": "model not loaded"}})
+                return
+            try:
+                cut = int(req.get("cut_cells", req.get("before_token", 0)))
+            except (TypeError, ValueError):
+                raise ValueError("cut_cells must be an integer")
+            if cut <= 0:
+                self._json(400, {"error": {"message": "cut_cells must be > 0"}})
+                return
+            res = svc.engine.kv_eject(cut)
+            if res is None:
+                self._json(503, {"error": {"message": "engine not running or does not support eject"}})
+            else:
+                self._json(200 if res.get("ok") else 409, res)
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")

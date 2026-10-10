@@ -66,6 +66,12 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
 
+/// A rebase drops the epoch: evict blocks [0, cut_blocks) and free the slots they held, leaving the
+/// blocks at or after `cut_blocks` exactly as they were. Returns how many of the retired blocks were
+/// still resident, which is the number whose host memory was worth releasing; -1 if the counter could
+/// not be allocated. Device-side, because the page table lives in VRAM.
+long long kv_stream_eject(const KvStreamMap& m, long long cut_blocks, void* stream);
+
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
 /// (n_q x (cap / page_size + 2)); a call that cannot sets ctl[3] (see `kv_stream_counters`).
