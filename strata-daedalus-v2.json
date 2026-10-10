@@ -50,5 +50,9 @@
   "env": {
     "STRATA_KV_TAPE_HOST": "1",
     "STRATA_KV_TAPE_DEBUG": "1"
+  },
+  "_notes": {
+    "reasoning_effort": "The endpoint holds NO opinion on reasoning effort. Do not add one to strata-daedalus.shared-settings.json: the server copies a shared reasoning_effort into any request that arrives without one (serve/server.py:1210-1216), which both overrides Daedalus's per-turn choice and silently disables reasoning when the client simply omits the field. Daedalus picks the effort per turn and sends reasoning_effort in extra_body (run_agent.py:7651-7672), mapping high/max/ultra down to xhigh because this model's template only knows xhigh, medium and low.",
+    "measured": "no field -> model reasons; low -> low; medium -> medium; none -> none."
   }
 }
