@@ -41,6 +41,21 @@ def chat(url, messages, max_tokens, timeout=900):
             "out": u.get("completion_tokens", 0), "text": text}
 
 
+def vm():
+    """Swap traffic and memory pressure: the suspects for a park that takes seconds instead of milliseconds."""
+    d = {}
+    try:
+        for line in open("/proc/vmstat"):
+            k, v = line.split()
+            if k in ("pswpin", "pswpout"):
+                d[k] = int(v)
+        psi = open("/proc/pressure/memory").read().split("\n")[0]
+        avail = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable")) // 1024
+    except (OSError, StopIteration, ValueError):
+        return d, "", 0
+    return d, psi, avail
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8091")
@@ -48,9 +63,12 @@ def main():
     ap.add_argument("--turns", type=int, default=4)
     ap.add_argument("--max-new", type=int, default=48)
     ap.add_argument("--no-side", action="store_true", help="control run: no side requests")
+    ap.add_argument("--rebase", action="store_true",
+                    help="end with a Daedalus-style rebase: same head, a summary instead of the middle, the last turns")
     ap.add_argument("--json", default="", help="write the raw rows here")
     a = ap.parse_args()
 
+    vm0, _, _ = vm()
     messages = [{"role": "system", "content": "You are a terse assistant.\n" + DOC * a.doc_repeat}]
     rows = []
     prev_was_side = False
@@ -69,6 +87,18 @@ def main():
         print(f"turn {k} side  : {s['s']:7.1f}s  prompt {s['prompt']:6d}  cached {s['cached']:6d}", flush=True)
         prev_was_side = True
 
+    if a.rebase:
+        keep = messages[-4:]
+        if keep and keep[0]["role"] != "user":
+            keep = keep[1:]
+        rebased = [messages[0], {"role": "user", "content": "[rebased] Earlier steps summarised: the user asked for "
+                                 "one short sentence per step about the text; all were answered."}] + keep
+        rb = chat(a.url, rebased, a.max_new)
+        rows.append(dict(rb, kind="rebase", turn=a.turns + 1))
+        print(f"rebase     : {rb['s']:7.1f}s  prompt {rb['prompt']:6d}  cached {rb['cached']:6d} "
+              f"({100 * rb['cached'] / max(rb['prompt'], 1):3.0f}%)  read {rb['prompt'] - rb['cached']} tokens",
+              flush=True)
+
     def mean(xs):
         return sum(xs) / len(xs) if xs else float("nan")
     base = [r["s"] for r in rows if r["kind"] == "main"][1:]          # the first turn is the cold read
@@ -77,6 +107,11 @@ def main():
     reuse = [r["cached"] / max(r["prompt"], 1) for r in rows if r["kind"].startswith("main")][1:]
     print(f"\nmain (warm, no side before): {mean(base):.1f}s   main right after a side call: {mean(after):.1f}s   "
           f"side call: {mean(side):.1f}s   mean reuse {100 * mean(reuse):.0f}%")
+    vm1, psi, avail = vm()
+    if vm1:
+        print(f"memory: swapped in {(vm1['pswpin'] - vm0.get('pswpin', 0)) * 4 // 1024} MiB, "
+              f"out {(vm1['pswpout'] - vm0.get('pswpout', 0)) * 4 // 1024} MiB during the run; "
+              f"MemAvailable {avail} MiB; {psi}")
     if a.json:
         with open(a.json, "w") as f:
             json.dump(rows, f, indent=1)
