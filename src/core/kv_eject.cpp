@@ -1,12 +1,11 @@
 // src/core/kv_eject.cpp - see include/strata/core/kv_eject.hpp for the contract.
 //
-// The host pools are one cudaHostAlloc region carved into k/v (+scales). Cells
-// are indexed identically across every pointer in the pool, so a cell range maps
-// to a byte range in each: cell c sits at offset c * kv_block_bytes(s, fmt).
-// That is the same arithmetic kv_stream_resolve uses when it copies a block back
-// in, which is why releasing a range here and faulting it back there agree.
+// The host pools are one cudaHostAlloc region carved into SEPARATE k, v (and scale) arrays, each indexed by
+// page. A cut of N pages is therefore the first N pages of EACH array: N * that array's bytes per page
+// (kv_eject_math.hpp), shrunk inward to whole OS pages so no byte of a kept cell is ever released.
 
 #include "strata/core/kv_eject.hpp"
+#include "strata/core/kv_eject_math.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -24,19 +23,18 @@ namespace strata::core {
 namespace {
 
 #if !defined(_WIN32)
-/// Release [p, p + bytes) back to the allocator. Returns the bytes actually
-/// released: madvise on a page-locked region fails with EINVAL, and that is
-/// reported as "stayed resident" rather than hidden.
-uint64_t release_range(void* p, uint64_t bytes) {
-    if (p == nullptr || bytes == 0) return 0;
-    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
-    const uintptr_t begin = (uintptr_t) p & ~(page - 1);
-    uintptr_t end = ((uintptr_t) p + bytes + page - 1) & ~(page - 1);
-    if (madvise((void*) begin, (uintptr_t) (end - begin), MADV_DONTNEED) != 0) return 0;
+/// Release [begin, end), already shrunk inward to whole OS pages (see inward_page_range). Returns the bytes
+/// actually released: madvise on a page-locked region fails with EINVAL, and that is reported as "stayed
+/// resident" rather than hidden.
+uint64_t release_range(uintptr_t begin, uintptr_t end) {
+    if (end <= begin) return 0;
+    if (madvise((void*) begin, (size_t) (end - begin), MADV_DONTNEED) != 0) return 0;
     return (uint64_t) (end - begin);
 }
+uintptr_t os_page_size() { return (uintptr_t) sysconf(_SC_PAGESIZE); }
 #else
-uint64_t release_range(void*, uint64_t) { return 0; }
+uint64_t release_range(uintptr_t, uintptr_t) { return 0; }
+uintptr_t os_page_size() { return 4096; }
 #endif
 
 /// Trim the allocator's free lists so freed arenas can leave the process. glibc
@@ -104,22 +102,30 @@ EjectReport kv_eject_before(const QsaState& st, const ModelGeometry& g,
     // 2. Release the host cells. Each pool pointer is indexed by the same cell
     //    coordinate, so one pass covers all of them.
     const int fmt = qsa_kv_format(st);
-    const uint64_t cell_bytes = strata::kernels::kv_block_bytes(s, fmt);
-    const uint64_t bytes = cell_bytes * (uint64_t) (cut_pages * s.page_size);
+    const uint64_t block_bytes = strata::kernels::kv_block_bytes(s, fmt);
+    const uint64_t rows = (uint64_t) (s.n_head_kv * s.page_size);
+    const PoolPageBytes pb = pool_page_bytes(fmt, block_bytes, rows, (uint64_t) s.head_dim);
 
-    void* pools[] = {
-        (void*) st.host.k_pool, (void*) st.host.v_pool,
-        (void*) st.host.k_q,    (void*) st.host.v_q,
-        (void*) st.host.k_scale, (void*) st.host.v_scale,
-        (void*) st.host.k_q4,   (void*) st.host.v_q4,
+    // Every host array is its own contiguous run indexed by page, so the range to release is the first
+    // `cut_pages` pages of THAT array: cut_pages * (the array's bytes per page). Sizing them all with
+    // block_bytes * cut_cells covered the neighbouring arrays and the end of the region.
+    struct Pool { void* p; uint64_t page_bytes; };
+    const Pool pools[] = {
+        {(void*) st.host.k_pool, pb.codes}, {(void*) st.host.v_pool, pb.codes},
+        {(void*) st.host.k_q, pb.codes},    {(void*) st.host.v_q, pb.codes},
+        {(void*) st.host.k_scale, pb.scales}, {(void*) st.host.v_scale, pb.scales},
+        {(void*) st.host.k_q4, pb.codes},   {(void*) st.host.v_q4, pb.codes},
     };
-    for (void* p : pools) {
-        if (p == nullptr) continue;
-        const uint64_t got = release_range(p, bytes);
+    for (const Pool& pool : pools) {
+        if (pool.p == nullptr || pool.page_bytes == 0) continue;
+        const HostRange r = inward_page_range((uintptr_t) pool.p, (uint64_t) cut_pages * pool.page_bytes,
+                                              os_page_size());
+        if (r.size() == 0) continue;                  // less than one whole OS page: nothing may be released
+        const uint64_t got = release_range(r.begin, r.end);
         rep.bytes_released += got;
-        if (got == 0) rep.bytes_locked += bytes;
+        if (got == 0) rep.bytes_locked += r.size();
     }
-    rep.pages_released = cell_bytes > 0 ? rep.bytes_released / cell_bytes : 0;
+    rep.pages_released = block_bytes > 0 ? rep.bytes_released / block_bytes : 0;
 
     // 3. Give the allocator's freed bytes a chance to leave the process.
     trim_heap();
