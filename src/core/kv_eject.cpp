@@ -116,7 +116,15 @@ EjectReport kv_eject_before(const QsaState& st, const ModelGeometry& g,
         {(void*) st.host.k_scale, pb.scales}, {(void*) st.host.v_scale, pb.scales},
         {(void*) st.host.k_q4, pb.codes},   {(void*) st.host.v_q4, pb.codes},
     };
+    // OFF by default. The host arrays are the AUTHORITATIVE copy of every cell: a block retired from the device
+    // is streamed back from here, so a released (zeroed) range turns into silent zero K/V the next time the
+    // tape reuses that prefix. The device retirement above is safe (a refault); this is not, and what it frees
+    // is pinned memory the OS cannot take back anyway (madvise says EINVAL). Opt in with
+    // STRATA_KV_EJECT_HOST_RELEASE=1 only for an experiment.
+    static const bool release_host = std::getenv("STRATA_KV_EJECT_HOST_RELEASE") != nullptr &&
+                                     std::getenv("STRATA_KV_EJECT_HOST_RELEASE")[0] == '1';
     for (const Pool& pool : pools) {
+        if (!release_host) break;
         if (pool.p == nullptr || pool.page_bytes == 0) continue;
         const HostRange r = inward_page_range((uintptr_t) pool.p, (uint64_t) cut_pages * pool.page_bytes,
                                               os_page_size());
@@ -131,7 +139,9 @@ EjectReport kv_eject_before(const QsaState& st, const ModelGeometry& g,
     trim_heap();
 
     rep.ok = true;
-    if (rep.bytes_locked > 0 && rep.bytes_released == 0) {
+    if (!release_host) {
+        rep.note = "cells retired from the device; host arrays kept (STRATA_KV_EJECT_HOST_RELEASE is off)";
+    } else if (rep.bytes_locked > 0 && rep.bytes_released == 0) {
         rep.note = "cells marked non-resident; host pools stayed resident (pinned)";
     } else {
         rep.note = "cells marked non-resident and released where not pinned";
