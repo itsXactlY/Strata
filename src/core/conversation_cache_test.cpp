@@ -557,6 +557,22 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    {
+        // DROP_PARKED: a rebase promoted the prewarmed next epoch, so the parked copy of the old one is dead
+        ConversationCache cache(1 << 20, 2);
+        cache.put(image({1, 2, 3}));
+        cache.put(image({9, 8, 7}));
+        std::vector<ConversationKv> buf;
+        cache.retain(std::move(buf), 10);
+        const size_t before = cache.bytes();
+        const auto d = cache.drop_all();
+        check(d.entries == 2 && d.bytes == before, "drop_all reports what it released");
+        check(cache.size() == 0 && cache.bytes() == 0 && cache.retained_bytes() == 0, "nothing parked or retained after");
+        check(cache.evictions() == 2, "dropped entries count as evictions, not restores");
+        check(cache.best(std::vector<int32_t>{1, 2, 3}, {}, true).tokens == 0, "a dropped conversation never matches again");
+        check(cache.can_fit(100), "the slot is free for the next park");
+        const auto none = cache.drop_all();
+        check(none.entries == 0 && none.bytes == 0, "dropping an empty cache is a no-op");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

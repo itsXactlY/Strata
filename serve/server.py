@@ -1956,6 +1956,34 @@ class StrataEngine:
                         "pages": _int(2), "released_mib": _int(4), "pinned_mib": _int(6)}
         return {"ok": False, "raw": "timeout"}
 
+    def drop_parked(self):
+        """Drop every parked conversation (engine command DROP_PARKED).
+
+        For a client that knows the conversation the engine moved away from is gone for good (a rebase promoted
+        the prewarmed next epoch). The caller holds the service's request lock, so no request is in flight and
+        this is the only reader of the engine's output. Returns None when the engine is not running."""
+        if getattr(self, "proc", None) is None:
+            return None
+        try:
+            self.proc.stdin.write("DROP_PARKED\n")
+            self.proc.stdin.flush()
+        except OSError:
+            return None
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                line = self.lines.get(timeout=0.5)
+            except Exception:
+                continue
+            text = (line if isinstance(line, str) else str(line or "")).strip()
+            if text.startswith("OK DROP_PARKED"):
+                parts = text.split()
+                try:
+                    return {"ok": True, "dropped": int(parts[2]), "released_mib": int(parts[3])}
+                except (IndexError, ValueError):
+                    return {"ok": True, "dropped": 0, "released_mib": 0}
+        return {"ok": False, "raw": "timeout"}
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
@@ -5677,6 +5705,8 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/kv/eject":
                     self._kv_eject(req)
+                elif path == "/v1/cache/drop_parked":
+                    self._cache_drop_parked(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
@@ -5982,6 +6012,28 @@ def make_handler(svc: Service):
             res = svc.engine.kv_eject(cut)
             if res is None:
                 self._json(503, {"error": {"message": "engine not running or does not support eject"}})
+            else:
+                self._json(200 if res.get("ok") else 409, res)
+
+        def _cache_drop_parked(self, req):
+            """POST /v1/cache/drop_parked - the conversation the engine moved away from is gone for good (a
+            rebase promoted the prewarmed next epoch), so drop every parked conversation instead of keeping
+            ~2 GB of a dead epoch. Waits for the request lock, so it never races a request in flight."""
+            if not svc.loaded():
+                self._json(503, {"error": {"message": "model not loaded"}})
+                return
+            if getattr(svc.engine, "batch", 0):
+                self._json(409, {"error": {"message": "batch slots are on: parked conversations are not dropped"}})
+                return
+            if not svc.fifo.acquire(timeout=30):
+                self._json(503, {"error": {"message": "the engine is busy"}})
+                return
+            try:
+                res = svc.engine.drop_parked()
+            finally:
+                svc.fifo.release()
+            if res is None:
+                self._json(503, {"error": {"message": "engine not running"}})
             else:
                 self._json(200 if res.get("ok") else 409, res)
 
