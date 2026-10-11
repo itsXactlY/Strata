@@ -6235,6 +6235,17 @@ int main(int argc, char** argv) {
             // hand the host bytes back to the allocator, so the tail stands alone and the prefix is gone
             // rather than merely unreachable. The cut is validated against the live write position below:
             // releasing a cell the current conversation still needs would corrupt the step in flight.
+            // DROP_PARKED: the client knows the conversation the engine moved away from is gone for good (a
+            // rebase promoted the prewarmed copy of the next epoch), so its parked copy is a dead epoch. Drop
+            // every parked conversation; the live one and its checkpoints are untouched.
+            if (line == "DROP_PARKED") {
+                const auto d = conversations.drop_all();
+                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu parked conversation(s), %zu MiB\n",
+                             d.entries, d.bytes >> 20);
+                std::printf("OK DROP_PARKED %zu %zu\n", d.entries, d.bytes >> 20);
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("EJECT ", 0) == 0) {
                 const long long cut = std::strtoll(line.c_str() + 6, nullptr, 10);
                 const long long written = (long long) live.size();

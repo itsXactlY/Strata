@@ -264,6 +264,22 @@ public:
     }
     size_t superseded() const { return superseded_; }
 
+    // Drop EVERY parked conversation and the retained reuse buffers, for a client that knows the conversation
+    // the engine just moved away from will never come back (a rebase promoted a prewarmed copy of the next
+    // epoch): parking that one was a ~2 GB copy of a dead epoch. Counted as evictions, never as a restore.
+    struct Dropped {
+        size_t entries = 0;
+        size_t bytes = 0;
+    };
+    Dropped drop_all() {
+        Dropped d{entries_.size(), bytes()};
+        evictions_ += entries_.size();
+        entries_.clear();
+        bytes_ = 0;
+        reuse_ = {};
+        return d;
+    }
+
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
