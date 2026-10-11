@@ -8,7 +8,7 @@ tape work (`engine/strata`; the previous binary is `engine/strata.pre-0.1.39-mer
 --expert-cache auto  --prefill auto  --spec 4  --mtp Strata-data/mtp/rt  --spec-min-p 0.5
 --max-context 65536  --kv int8  --kv-resident 32768  --vram-reserve-mib 1400
 --conversation-cache-mib 4096  --conversation-cache-slots 2  --conversation-cache-min-free-mib 1024
---resident-budget-gib 20  --prompt-cache 12  --prompt-cache-every 8192
+--resident-budget-gib 20  --prompt-cache 12          (NOT --prompt-cache-every 8192, see below)
 env: STRATA_KV_TAPE_HOST=1          (no STRATA_KV_TAPE_DEBUG, no STRATA_KV_EJECT_HOST_RELEASE, no "parallel")
 ```
 
@@ -19,7 +19,7 @@ env: STRATA_KV_TAPE_HOST=1          (no STRATA_KV_TAPE_DEBUG, no STRATA_KV_EJECT
 | `--vram-reserve-mib 1400` | the Mazemaker embedding worker sits on the same GPU |
 | `--conversation-cache-* 4096 / 2 / 1024` | two parked conversations; parking measured cheap (0.2-0.4 s per ~16k tokens), `parallel: 2` measured worse (below) |
 | `--resident-budget-gib 20` | an upper bound: the engine grants what RAM allows (available - 4 GiB - margin; 19.1 GiB on a quiet box, pinned 15.55 GiB). This is the decode-speed lever |
-| `--prompt-cache 12 --prompt-cache-every 8192` | checkpoints are the ONLY resume points. With the default 6 and every 16384, the end of a kept head is rotated out within a few turns and every rebase falls back to the oldest checkpoint (the end of the system prompt) |
+| `--prompt-cache 12` | checkpoints are the ONLY resume points; more leaves survive longer. Keep `--prompt-cache-every` at its default (16384): see the warning below |
 
 ## Measured 2026-10-11 (`tools/tape_slot_bench.py`, ~30.6k-token tape, 58-token side call between turns)
 
@@ -32,11 +32,22 @@ env: STRATA_KV_TAPE_HOST=1          (no STRATA_KV_TAPE_DEBUG, no STRATA_KV_EJECT
 
 Reuse was 100% on every warm turn. `kv_tape_parity` (37 tests / 241 assertions) and `kv_stream_verify` pass on the merged tree.
 
+## Warning: do not set `--prompt-cache-every` below the system+tools length
+
+The engine pins the OLDEST checkpoint for good. In Daedalus the fixed prefix (system 3.9k + tools 8.5k) is 12,638 tokens,
+so with the default cadence (16384) the first checkpoint is the end of that prefix and every rebase resumes at 12,638.
+With `--prompt-cache-every 8192` the first checkpoint is at 8,192 and is the one pinned: live rebases then reused only 8,192
+and re-read 7-11k tokens in 37-48 s (strata-tape.log, 2026-10-11). The bench above missed this because its system prompt
+was 30k tokens. The 4-8 s rebase in the table is that bench's, NOT a Daedalus rebase.
+
 ## Notes
 
 - Memory is the thing to watch: with the engine loaded, MemAvailable sits near 4 GB. Lower `--resident-budget-gib` trades decode
   speed (12 GiB halves it) for headroom; the better lever is freeing RAM elsewhere.
 - Checkpoints cost ~118 MB each of host RAM (12 = ~1.4 GB).
+- Parked conversations: the live panel showed "parked 4 / restored 0" and parks of 1.4-12.7 s (not the 0.2-0.4 s of the quiet
+  bench); a 33k-token snapshot is ~2.0 GB, so 2 slots reserve ~4 GB on a box under memory pressure. One slot is enough to
+  park main while a side call runs; whether to keep any is open.
 - The bench's rebase diverges at the end of a 30k system prompt; Daedalus's real rebase diverges after a ~12.6k system+tools
   head plus its kept head messages, so the gain there depends on a checkpoint surviving at that position. Not measured with
   a live Daedalus session yet.
