@@ -52,3 +52,24 @@ was 30k tokens. The 4-8 s rebase in the table is that bench's, NOT a Daedalus re
   head plus its kept head messages, so the gain there depends on a checkpoint surviving at that position. Not measured with
   a live Daedalus session yet.
 - The 32-38 s park seen in the old live log was not reproducible with either engine; memory pressure is the suspect.
+
+## 2026-10-14: the holygoat engine as the Daedalus tape (`strata-holygoat.json`)
+
+Engine `engine/strata` = holygoat (806442f, no DROP_PARKED: Daedalus asks once and stops). Served by
+`daedalus doctor start strata` (`MAIN_PROFILE=strata` in `~/.daedalus/stack.conf`).
+
+```
+holygoat args + --max-context 40960 --vram-reserve-mib 800
+                + --conversation-cache-mib 3072 --conversation-cache-slots 1 --conversation-cache-min-free-mib 1024
+                + --prompt-cache 8
+"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}   (the GGUF's; without it every request was greedy)
+```
+
+| | value |
+|---|---|
+| expert arena | full resident (16.19 GiB RAM, 4443 GPU slots, no file reads). At 1400 MiB reserve / 65536 ctx it fell 1.92 GiB short (available RAM - fixed 4 GiB headroom) and decode dropped to 24-27 tok/s |
+| decode at ~31k, varied code, 600-token answers | 34-44 tok/s (temp 1.0: 34-40, temp 0.7: 33-44, greedy: 37-40); drafts 63-70% accepted |
+| the old 50-60 tok/s | repetitive bench text, ~96% of drafts accepted: not reachable on varied output on this box |
+| side call with main parked | 0.6-1.0 s (park ~0.3 s, restore 75-85 ms), reuse 100% |
+| rebase (bench) | 4.1 s, 99% reused |
+| Daedalus | window 40960, compression.threshold 0.83 -> rebase at 34.0k, ~7k left for a reply |
