@@ -11,12 +11,15 @@ The installer recommends one for your PC; this page explains the choice. Back to
 
 | Your RAM | Take | Why |
 | --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too: [low-RAM mode](#a-big-graphics-card-and-little-ram)) |
+| **32 GB** | **Coder** | it fits 32 GB; best at code, weaker at everything else ([why](#coder)). With a 24 GB card, Q2_0 and IQ2_XS run too ([low-RAM mode](#a-big-graphics-card-and-little-ram)) and are the better pick for general use |
 | **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
 | **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits (IQ3_S with little else open) |
-| **96 GB or more** | **IQ3_S**, or [Unsloth's 4-bit](#unsloth-ud-q4_k_xl-experimental) (experimental) | room for the largest sizes |
+| **96 GB or more** | **IQ3_S**, or [Unsloth's UD-IQ4_XS or UD-Q4_K_XL](#unsloths-files-ud-iq4_xs-to-q8_0) (~4-bit) | room for the largest sizes |
+| **128-192 GB** | [Unsloth's UD-Q5_K_XL, UD-Q6_K_XL or Q8_0](#unsloths-files-ud-iq4_xs-to-q8_0) | every expert of the 5-8-bit files in RAM |
 
-Not sure? Take **IQ2_XS** - or the **Coder** if you mainly write code, or have 32-48 GB of RAM.
+Not sure? Take **IQ2_XS**. The **Coder** is the one that fits a 32 GB PC, but it keeps only 256 of the 512 experts,
+chosen on code data, so it is weaker outside code and in languages other than English. For general use, or whenever
+your RAM allows, take a full model (Q2_0, IQ2_XS or IQ3_S).
 
 ## How fast is each size
 
@@ -49,7 +52,7 @@ A card with more VRAM is faster, because more of the model fits on the GPU: an R
 RX 9060 XT, RX 6900 XT) are in [AMD_HIP.md](AMD_HIP.md#rdna4-gfx1201).
 
 Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
-(about 5-10 minutes; on the PC above it made the Coder 7% faster; NVIDIA cards for now). Measured Strata on your own
+(about 15-30 minutes, longer on a slow card; on the PC above it made the Coder 7% faster; NVIDIA cards for now). Measured Strata on your own
 PC? See [Community benchmark results](COMMUNITY_BENCHMARKS.md) for a report template and how to share your results
 in a pull request.
 
@@ -60,7 +63,7 @@ in a pull request.
 | **Q2_0** | 37.6 GB | fastest | good |
 | **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
 | **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests |
 
 The download is 66-76 GB for the three smaller sizes ([details](DETAILS.md#which-model)); the first start also
 fetches the MTP draft layer (~6 GB, +1 GB with images).
@@ -69,8 +72,9 @@ fetches the MTP draft layer (~6 GB, +1 GB with images).
 
 Shard 1 is the part of the model that gets loaded when it starts: its experts go into your **RAM**, the rest onto
 your graphics card (the second shard, a 29 GB lookup table, stays on the SSD). So it fits when your **RAM is at least
-shard 1 + about 10 GB** for Windows and your other programs. With 64 GB of RAM every size fits (IQ3_S with little
-else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't lower the RAM needed
+the experts + about 10 GB** for Windows and your other programs - the experts are most of shard 1: 34 GB for Q2_0,
+35.5 for IQ2_XS, 43 for IQ3_XXS, 50 for IQ3_S, 23 for the Coder (the dense weights in shard 1 go to the graphics
+card). With 64 GB of RAM every size fits (IQ3_S with little else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't lower the RAM needed
 - except in the low-RAM mode below.
 
 ### A big graphics card and little RAM
@@ -91,12 +95,12 @@ The original, in all four sizes. With images, and with the
 ### Coder
 
 **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** - ISTA-DASLab's coding version:
-half of the experts removed, keeping the ones that code, tool use and images need (91% of the full model's SWE-bench
-Verified score, 99% of LiveCodeBench, by its authors). One size (IQ1_M: its experts stored like IQ3_S): shard 1 is
-**29.6 GB**, so it fits a PC with **32 GB of RAM**, runs 262K context on 64 GB, and reads long prompts the fastest of
-all. It is weaker outside code, and that includes Chinese and other CJK text (#438: Chinese answers came out wrong
-or looping where English was fine). For general chat or CJK text, take a size that keeps every expert: Q2_0,
-IQ2_XS or IQ3_S.
+it keeps 256 of each layer's 512 experts, chosen on code (with agentic and image) data, and drops the rest (91% of
+the full model's SWE-bench Verified score, 99% of LiveCodeBench, by its authors). One size (IQ1_M: its experts stored
+like IQ3_S): shard 1 is **29.6 GB**, so it fits a PC with **32 GB of RAM**, runs 262K context on 64 GB, and reads long
+prompts the fastest of all. With half the experts gone it is weaker outside code and in languages other than
+English, Chinese and other CJK text included (#438: Chinese answers came out wrong or looping where English was
+fine). For general use, or whenever your RAM allows, take a size that keeps every expert: Q2_0, IQ2_XS or IQ3_S.
 More: [details](DETAILS.md#or-the-coder-half-the-experts-for-code).
 
 ```
@@ -107,23 +111,37 @@ START-HERE.bat --setup --family coder
 
 **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI that
 thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+token, and about the same RAM as the same size of the original. Its own license applies (see its page).
 More: [details](DETAILS.md#or-swift-15-a-fine-tune-that-thinks-shorter).
 
 ```
 START-HERE.bat --setup --family swift --model IQ2_XS
 ```
 
-### Unsloth UD-Q4_K_XL (experimental)
+<a id="unsloth-ud-iq4_xs"></a><a id="unsloth-ud-q4_k_xl-experimental"></a>
 
-**Unsloth's 4-bit UD-Q4_K_XL** (experimental) is the fourth version in setup's menu (`--family unsloth`): the closest
-to the full model, but a 111 GB download whose 77 GB of experts do not fit in RAM. Strata keeps your RAM minus 24 GB
-of them in RAM and reads the rest from the SSD while it answers: 7-8.5 tokens/s on a 64 GB PC with a 12 GB GPU, several
-times slower than the sizes above, and long prompts are slow. It needs 48 GB of RAM or more, an NVMe SSD and one
-NVIDIA GPU (no images yet). Details and measurements: [UD-Q4_K_XL](UNSLOTH_Q4.md).
+### Unsloth's files: UD-IQ4_XS to Q8_0
+
+The fourth version in setup's menu (`--family unsloth`) is **Unsloth's quantizations** of the same model, from ~4 to 8
+bits. They keep the original's experts at more bits than the 2-3-bit sizes above, so they need more RAM. Setup keeps
+every expert in RAM where they and 16 GB more fit (the fastest way); with less RAM it keeps as many as fit and reads
+the rest from the SSD while it answers (much slower), and for the bigger files it asks first. Images are on by default
+on an NVIDIA card of 16 GB or more (and on AMD with the CPU encoder where the experts fit in RAM).
+
+| Size | Download | Experts | RAM for all of them in RAM | Same top token as Q8_0 | AMD R9700 (32 GB): story / code / 32K prompt |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **UD-IQ4_XS** (setup's first) | 94 GB | 55 GiB | ~72 GB | 88.9% | - |
+| **UD-Q4_K_XL** | 111 GB | 72 GiB | ~88 GB | 93.1% | 63 / 87 tok/s / 1,110-1,320 tok/s |
+| **UD-Q5_K_XL** | 158 GB | 92 GiB | ~108 GB | 94.6% | 57-60 / 82 / 810-1,260 |
+| **UD-Q6_K_XL** | 169 GB | 102 GiB | ~118 GB | 94.6% | 54 / 76 / 1,020 |
+| **Q8_0** | 188 GB | 120 GiB | ~136 GB | 100% (the reference) | 53-57 / 66-74 / 1,230-1,300 |
+
+For comparison, IQ3_S on the same card: 75 / 95 tok/s, 87.7% the same top token as Q8_0. The quality numbers, the
+speed bound and NVIDIA/AMD/Intel details: [QUANTS.md](QUANTS.md); the files: [UD-Q4_K_XL](UNSLOTH_Q4.md),
+[UD-Q6_K_XL](UNSLOTH_Q6.md).
 
 ```
-START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
+START-HERE.bat --setup --family unsloth --model UD-Q5_K_XL
 ```
 
 ### OrcaRouter Uncensored IQ3_XXS

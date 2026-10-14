@@ -61,6 +61,13 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         tg->to_float(blob.data() + f.up_off + r * f.gu_row, U.data() + r * H, H);
     }
     for (int64_t r = 0; r < H; ++r) td->to_float(blob.data() + f.down_off + r * f.d_row, D.data() + r * FF, FF);
+    if (f.tail_off) {   // the blob's scales, as the engine applies them (gate and up as read, down on its output)
+        float tail[4];
+        std::memcpy(tail, blob.data() + f.tail_off, sizeof tail);
+        for (auto& v : G) v *= tail[0];
+        for (auto& v : U) v *= tail[1];
+        for (auto& v : D) v *= tail[2];
+    }
     std::mt19937 rng(11 + seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> x((size_t) NT * H);
@@ -94,7 +101,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             ffp[k] = ff[k].data();
         }
         cpu::native_gu_rows(f, blob.data(), a, NT, ffp, 0, (int) FF);
-        if (cpu::iq512_supported(f.gu_type)) {
+        // either multi-token kernel: IQ4_XS has an AVX-2 one and no AVX-512 one, so the gate cannot be
+        // iq512_supported alone - that would leave the format untested on every CPU.
+        if (cpu::iq512_supported(f.gu_type) || cpu::iq256_supported(f.gu_type)) {
             // ggml's own vec_dot, same Q8_K activations: the reference for both multi-token kernels
             // (float-order differences only)
             const auto* tc = ggml_get_type_traits_cpu((ggml_type) f.gu_type);
@@ -143,8 +152,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                             tag, us1, 2.0 * f.up_off / us1 / 1e3, usg, 2.0 * f.up_off / usg / 1e3);
                 std::printf("          gate+up %d tokens one thread: %s %.0f us vs ggml %d x %.0f us\n", NT, tag, usn, NT, usg);
             };
-            if (cpu::cpu_avx512_ok()) check("avx512", true);   // guarded: the binary runs on AVX-2 CPUs too
-            check("avx2", false);
+            // guarded: the binary runs on AVX-2 CPUs too, and IQ4_XS has no AVX-512 kernel (an empty switch)
+            if (cpu::cpu_avx512_ok() && cpu::iq512_supported(f.gu_type)) check("avx512", true);
+            if (cpu::cpu_avx2_ok() && cpu::iq256_supported(f.gu_type)) check("avx2", false);   // no AVX2: ggml-cpu only
         }
         for (int k = 0; k < NT; ++k) {
             cpu::native_quant_h(f, ff[k].data(), hq[k].data());
@@ -177,7 +187,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         // BIT FOR BIT, for 1..8 tokens; then the time of 4 tokens (a verify window) both ways
         for (int role = 0; role < 2; ++role) {
             const int type = role == 0 ? f.gu_type : f.d_type;
-            if (!cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
+            if (!cpu::cpu_avx2_ok() || !cpu::kq256_supported(type) || (role == 0 && type != 12)) continue;
             const int n = role == 0 ? (int) H : (int) FF, rows = role == 0 ? (int) FF : (int) H;
             const size_t rb = role == 0 ? f.gu_row : f.d_row;
             const uint8_t* w = blob.data() + (role == 0 ? 0 : f.down_off);
@@ -220,7 +230,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
                         role == 0 ? "gate" : "down", differ, us_k, us_g, us_g / us_k);
             if (differ) ++failures;
         }
-        if (f.d_type == 42) {
+        if (cpu::q2_native_kernels(f.d_type)) {
             // (b2) the GGUF-layout Q2_0 kernel the pool uses for Q2_0 down projections - the AVX-512 one
             // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512
             // kernel unconditionally faults on a Zen 2/3 CPU.
@@ -237,7 +247,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             std::printf("          q2_0 %s down vs ggml down: rel %.2e\n",
                         cpu::cpu_avx512_ok() ? "AVX-512" : "AVX-2", rel(alt, got_c));
         }
-        if (f.d_type == 20) {
+        if (f.d_type == 20 && cpu::cpu_avx2_ok()) {
             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
@@ -401,6 +411,11 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
     quant(f.gu_type, FF, H, blob.data());
     quant(f.gu_type, FF, H, blob.data() + f.up_off);
     quant(f.d_type, H, FF, blob.data() + f.down_off);
+    if (f.tail_off) {   // NVFP4's {s_gate, s_up, s_down, 0}: non-unit for an NVFP4 projection, 1.0 for another format
+        const bool g4 = f.gu_type == 40, d4 = f.d_type == 40;
+        const float tail[4] = {g4 ? 0.75f : 1.f, g4 ? 1.25f : 1.f, d4 ? 0.5f : 1.f, 0.f};
+        std::memcpy(blob.data() + f.tail_off, tail, sizeof tail);
+    }
     return blob;
 }
 

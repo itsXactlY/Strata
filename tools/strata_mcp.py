@@ -55,13 +55,31 @@ FALLBACK_MODELS = {
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
                 "ram_gb": 60, "arena_gb": 42.9},
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
-              "families": ("qwen",)},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
-    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
-                            "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
-                   "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
+                           "less than ~80 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
+                  "vision": True},
+    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic): K-quant experts, between UD-IQ4_XS and UD-Q5_K_XL in quality",
+                   "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
+                   "vision": True},                       # #967: images allowed (setup warns: untested with this file)
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality",
+                   "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs",
+                   "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0); for a 192 GB PC",
+             "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
+             "vision": True},
+    "NVFP4": {"about": "4-bit NVFP4 experts, GPTQ (sergqwer's strata-nvfp4 pack); RTX 50 has FP4 tensor cores, other "
+                       "NVIDIA cards run it at 8-bit precision", "download_gb": 128.0, "ram_gb": 80, "arena_gb": 68.0,
+              "families": ("nvfp4",), "vision": True},
+    "NVFP4-NVIDIA": {"about": "NVIDIA's own NVFP4 checkpoint (plain rounding), converted by sergqwer; the same size "
+                              "and speed as NVFP4", "download_gb": 128.0, "ram_gb": 80, "arena_gb": 68.0,
+                     "families": ("nvfp4",), "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -69,11 +87,16 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "4-bit, 111 GB download, most experts read from the "
-                                                                  "SSD: slow (7-8.5 tokens/s on a 64 GB PC)",
-                "tag": "unsloth-", "experimental": True, "vision": False},
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL or Q8_0 "
+                                                                  "(94 to 188 GB downloads): every expert in RAM from "
+                                                                  "~80 GB (UD-IQ4_XS) to ~136 GB (Q8_0) of RAM, else "
+                                                                  "part of them read from the SSD",
+                "tag": "unsloth-", "vision": True},
+    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, "
+                                                              "~80 GB of RAM to keep every expert in RAM",
+              "tag": "nvfp4-"},
 }
-FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
+FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
                 "Plain prose, no title.")
 
@@ -422,7 +445,9 @@ class Strata:
 
     @staticmethod
     def sizes_of(models, family) -> list:
-        return [m for m in models if family in models[m].get("families", ("qwen", "swift"))]
+        """The family's sizes as setup lists them: an experimental one last (never the default)."""
+        return sorted((m for m in models if family in models[m].get("families", ("qwen", "swift"))),
+                      key=lambda m: bool(models[m].get("experimental")))
 
     # ---- paths
     def settings_path(self) -> Path:
@@ -473,7 +498,8 @@ class Strata:
 
     # ---- what is installed
     def configs(self) -> list[Path]:
-        return sorted(self.root.glob("strata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return sorted((p for p in self.root.glob("strata-*.json") if not p.name.endswith(".shared-settings.json")),
+                      key=lambda p: p.stat().st_mtime, reverse=True)   # #346: the Chat settings file is no config
 
     @staticmethod
     def read_config(path: Path) -> dict:
@@ -676,8 +702,9 @@ class Strata:
         ctx = 32768 if vram < 14 else 65536 if vram < 20 else 131072
         if vram < 11:
             notes.append("less than 12 GB of VRAM: it runs, but slowly (most experts stay on the CPU)")
-        if hw.get("cpu", {}).get("avx2") is False:
-            return {"family": None, "model": None, "why": "this CPU has no AVX2; Strata needs at least AVX2"}
+        if hw.get("cpu", {}).get("avx2") is False:      # #623: a warning, not a stop (setup compiles for it)
+            notes.append("this CPU has no AVX2: EXPERIMENTAL and slow - setup compiles the engine on this PC for the "
+                         "older CPU (10-20 minutes), and the CPU's share of the experts runs a few times slower")
         if backend == "hip":
             notes.append("AMD (experimental, Linux): the engine is compiled during setup; no images")
         cmd = (("START-HERE.bat --setup" if WIN else "./setup.sh --setup") +
@@ -703,18 +730,26 @@ class Strata:
                 if ram is not None:
                     verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
                     try:
-                        if d.get("budget"):
-                            verdict = ("experimental: part of its experts in RAM, the rest read from the SSD"
-                                       if ram >= d["ram_gb"] else "does not fit")
+                        if d.get("budget") and S and hasattr(S, "unsloth_budget") and not S.unsloth_budget(m, ram):
+                            verdict = ("experimental: " if d.get("experimental") else "") + "fits (all of its experts in RAM)"
+                        elif d.get("budget"):
+                            verdict = (("experimental: " if d.get("experimental") else "")
+                                       + "part of its experts in RAM, the rest read from the SSD"
+                                       if ram >= d["ram_gb"] else
+                                       "slow here: part of its experts in RAM, the rest read from the SSD (setup "
+                                       "asks first)" if ram >= 48 else "does not fit")
                         elif S and S.low_ram_needed(m, ram) and S.low_ram_fits(m, ram, vram):
                             verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
                     except Exception:                   # noqa: BLE001
                         pass
                 sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
+                              "experimental": bool(d.get("experimental")),
+                              "images": d.get("vision", fd.get("vision", True)) is not False,
                               "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"),
                               "on_this_pc": verdict, "installed": tag in have, "id": tag})
             out.append({"family": f, "title": fd["title"], "about": fd.get("about"),
-                        "experimental": bool(fd.get("experimental")), "images": fd.get("vision", True) is not False,
+                        "experimental": bool(fd.get("experimental")),
+                        "images": any(x["images"] for x in sizes) if sizes else fd.get("vision", True) is not False,
                         "sizes": sizes})
         return out
 
@@ -930,7 +965,7 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
          "annotations": ro},
         {"name": "strata_models", "title": "Strata models",
          "description": "The models and sizes Strata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
-                        "Swift 1.5, coder = the Coder, unsloth = experimental 4-bit), with download size, RAM needed, "
+                        "Swift 1.5, coder = the Coder, unsloth = Unsloth's ~4-bit), with download size, RAM needed, "
                         "whether each fits this PC, which are installed, the context lengths, and the recommendation. "
                         "Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
@@ -947,7 +982,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "family": {"type": "string", "enum": list(families),
                         "description": "qwen = Qwen3.8-Flash-Next (the original), swift = Swift 1.5 (thinks "
                                        "shorter), coder = the Coder (half the experts, ~32 GB RAM, for code), "
-                                       "unsloth = 4-bit EXPERIMENTAL (slow)"},
+                                       "unsloth = Unsloth's 4- to 8-bit files (UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, "
+                                       "UD-Q6_K_XL, Q8_0): every expert in RAM where they fit, else part of them read "
+                                       "from the SSD"},
              "model": {"type": "string", "enum": list(models),
                        "description": "the size (quantization): see strata_models"},
              "context": {"type": "integer", "enum": contexts,
@@ -1217,12 +1254,21 @@ class Tools:
             usable = [g for g in hw.get("gpus", []) if g.get("usable")]
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
-            if models[model].get("budget"):
+            if models[model].get("budget") and (not hasattr(s.setup_module(), "unsloth_budget") or
+                                                s.setup_module().unsloth_budget(model, hw.get("ram_gb") or 0.0)):
                 context = 8192 if vram < 14 else 32768
-        if vision in ("yes", "gpu", "cpu") and families[family].get("vision") is False:
-            raise ToolError(f"images are not available with {families[family]['title']} yet: use vision=no")
+        if vision in ("yes", "gpu", "cpu") and models[model].get("vision", families[family].get("vision")) is False:
+            raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
         if vision is not None and backend == "hip" and vision != "no":
-            raise ToolError("images are not available on the AMD backend yet: use vision=no")
+            # setup.py's hip_vision rules (#990): the AMD backend has no GPU image encoder, but --vision cpu reads
+            # images on the CPU beside it (Linux; the ready-made Windows AMD engine has no encoder)
+            if vision == "cpu" and not WIN:
+                pass
+            elif vision == "cpu":
+                raise ToolError("images on the CPU with an AMD card are Linux-only for now: use vision=no")
+            else:
+                raise ToolError("the AMD backend has no GPU image encoder yet: use vision=cpu (images on the CPU, "
+                                "Linux) or vision=no")
         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
         tag = (families[family].get("tag", "") + model)
         have_dir = target / "models" / tag
@@ -1261,7 +1307,7 @@ class Tools:
                             "the options (finished steps are skipped)")
         if families[family].get("license"):
             plan["license"] = families[family]["license"]
-        if families[family].get("experimental"):
+        if families[family].get("experimental") or models[model].get("experimental"):
             plan["experimental"] = True
         return plan, args
 
