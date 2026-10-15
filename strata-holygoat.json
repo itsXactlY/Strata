@@ -1,0 +1,73 @@
+{
+ "exe": "/home/alca/projects/llama.cpp-strata/engine/strata",
+ "args": [
+  "--pack",
+  "/home/alca/projects/Strata-data/packs/coder-iq1_m",
+  "--native",
+  "/home/alca/projects/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+  "--ple-gguf",
+  "/home/alca/projects/Strata-data/models/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+  "--expert-profile",
+  "/home/alca/projects/llama.cpp-strata/data/expert-profile-coder.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "2048",
+  "--spec",
+  "4",
+  "--mtp",
+  "/home/alca/projects/Strata-data/mtp/rt",
+  "--max-context",
+  "40960",
+  "--kv",
+  "q4_0",
+  "--resident-experts",
+  "--spec-min-p",
+  "0.5",
+  "--vram-reserve-mib",
+  "800",
+  "--conversation-cache-mib",
+  "3072",
+  "--conversation-cache-slots",
+  "1",
+  "--conversation-cache-min-free-mib",
+  "1024",
+  "--prompt-cache",
+  "2",
+  "--prompt-cache-every",
+  "0"
+ ],
+ "cwd": "/home/alca/projects/llama.cpp-strata",
+ "tokenizer": "/home/alca/projects/Strata-data/packs/coder-iq1_m/tokenizer",
+ "model_name": "qwen3.8-flash-next-coder-iq1_m",
+ "log": "/home/alca/projects/llama.cpp-strata/strata-holygoat.log",
+ "lib_dirs": [
+  "/opt/cuda/bin",
+  "/opt/cuda/lib64"
+ ],
+ "port": 8080,
+ "gpu": 0,
+ "gpus_asked": true,
+ "api_monitor": false,
+ "env": {
+  "STRATA_KV_TAPE_HOST": "1",
+  "STRATA_KV_TAPE_DEBUG": "1"
+ },
+ "_notes": {
+  "engine": "engine/strata is built from 806442fdd9d62fcb788a2930ae83879f6f6174a0 [DAEDALUS-HOLYGOAT] (2026-10-09). Built in the worktree /home/alca/projects/llama.cpp-strata-holygoat, Release + STRATA_ENABLE_CUDA=ON + STRATA_NATIVE_EXPERTS=ON, CMAKE_CUDA_ARCHITECTURES=89, GGML_CUDA=OFF. The previous binary is kept as engine/strata.pre-holygoat.",
+  "base": "Derived from strata-coder-iq1_m.json. Differences, all deliberate: --prefill 2048 instead of auto, --vram-reserve-mib 1400 added, and the TAPE env vars added.",
+  "prefill_2048": "Measured on this host, same engine family: prefill 2048 drove file-backed prefill reads to 0 where auto/8192 needed 1128, at 36.20 tok/s decode versus 35.14. Strata-daedalus-v2.json leaves it on auto.",
+  "vram_reserve_1400": "Held back so a second GPU consumer has room. With the reserve at 1750 the embedding model also fitted; 1400 is the value strata-daedalus-v2.json measured with.",
+  "resident_experts": "Full expert arena, no --resident-budget-gib. strata-daedalus-v2.json caps at 28 GiB; the cap was rejected because a budget cap trades decode speed and buys margin that the measurements show is not needed.",
+  "tape_env": "Holygoat is the commit that added the host mirror with thread-local scratch and the qsa_kv_resolve debug logging, so STRATA_KV_TAPE_HOST=1 and STRATA_KV_TAPE_DEBUG=1 are what exercise that code. The counters print to the engine's stderr, which server.py redirects into the log file above, not to the server's stdout.",
+  "hidden_flags": "--vram-reserve-mib and --spec-min-p are parsed at src/program/generate.cpp:1173 and :1195 but are absent from --help. Their absence from the help text is not evidence that a config using them is invalid.",
+  "endpoint": "Daedalus points at http://127.0.0.1:8080/v1 with model qwen3.8-flash-next-coder-iq1_m and context_length 65536. Every strata-*.json in this repo is a port-8080 variant; only one can be served at a time.",
+  "tape_2026_10_14": "Daedalus tape on holygoat: vram reserve 1400->1024 and max-context 65536->49152 give the expert cache more VRAM so the RAM complement fits (it fell 1.92 GiB short at 1400/65536); one parking slot (3072 MiB, on demand) so a side call parks main instead of evicting it; 8 checkpoints as rebase resume points; sampling = the GGUF's own (temp 1.0, top_p 0.95, top_k 20): without it every Daedalus request decoded greedily. Backup: strata-holygoat.json.bak-20261014",
+  "tape_checkpoints": "2 checkpoints, no mid-prompt ones: root (end of system+tools, pinned) = where every rebase resumes after the middle is ejected; leaf (last turn boundary) = where the next turn appends. Parking needs >= 1."
+ },
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20
+ }
+}
