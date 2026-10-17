@@ -475,6 +475,7 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    bool kv_shared = false;            ///< --kv-shared: one host K/V window shared by the main session and the slots
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -2336,6 +2337,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
+        else if (a == "--kv-shared") o.kv_shared = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
@@ -4960,6 +4962,16 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
+        // --kv-shared: the streamed host K/V of the main session and of every batch slot is one window of
+        // --max-context cells: each maps only what its conversation reaches, and a slot copy trades the cells
+        if (o.kv_shared) {
+            const bool on = o.serve && !multi_gpu && o.kv_resident > 0 && strata::core::vmm_host_available();
+            if (!on)
+                std::fprintf(stderr, "strata generate: --kv-shared is off (--serve, one GPU, KV streaming --kv-resident, "
+                                     "host virtual memory)\n");
+            strata::core::qsa_set_kv_lazy(on);
+            o.kv_shared = on;
+        }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
@@ -4968,7 +4980,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
         }
-        if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
+        if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1 && o.kv_shared)
+            std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
+                                 "RAM mapped as the conversations reach it (--kv-shared: one window for the main "
+                                 "session and the batch slots)\n",
+                         (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4), (long long) o.max_context);
+        else if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
             std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
                                  "%.2f GiB of pinned RAM\n",
                          (long long) (ss.qsa_states[ss.qsa_primary()].n_slots * 4),
@@ -10747,6 +10764,54 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
+        // ---- --kv-shared: the main session and the slots draw on one host K/V window.  A slot copy trades the cells
+        // (conversation_kv_exchange) instead of copying them, so the side that gave its cells holds nothing reusable:
+        // a slot is uncached, the main session marked stale (its live/checks are dropped once the caller used them)
+        bool kvs_main_stale = false;
+        int64_t kvs_target = 0;   // the cells the request being read may reach (prompt + replies + margin)
+        auto kvs_cells = [&](strata::core::SessionState& s) -> int64_t {
+            return s.qsa_alloc > 0 ? strata::core::qsa_kv_host_cells(s.qsa_states[s.qsa_ord0]) : 0;
+        };
+        auto kvs_commit = [&](strata::core::SessionState& s, int64_t cells) -> bool {
+            for (int64_t j = 0; j < s.qsa_alloc; ++j)
+                if (!strata::core::qsa_kv_host_commit(s.qsa_states[s.qsa_ord0 + j], cells)) return false;
+            return true;
+        };
+        auto kvs_trim = [&](strata::core::SessionState& s, int64_t cells) {
+            for (int64_t j = 0; j < s.qsa_alloc; ++j) strata::core::qsa_kv_host_trim(s.qsa_states[s.qsa_ord0 + j], cells);
+        };
+        auto kvs_exchange = [&](bool into_slot, int b, const ConvCheckpoint* at, const std::vector<int32_t>& ids,
+                                std::string& e) -> bool {
+            const int64_t upto = (int64_t) ids.size();
+            strata::core::SessionState& slot_ss = *bslot_ss[0][(size_t) b];
+            strata::core::SessionState& from = into_slot ? ss : slot_ss;
+            strata::core::SessionState& to = into_slot ? slot_ss : ss;
+            if (cudaDeviceSynchronize() != cudaSuccess) { e = "--kv-shared: device sync failed"; return false; }
+            if (at != nullptr) {
+                if (!strata::core::conversation_checkpoint_restore(*at, to, g, e)) return false;
+            } else {
+                strata::core::ConversationCheckpoint ck;
+                ck.ids = ids;
+                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                    return false;
+            }
+            for (int64_t j = 0; j < from.qsa_alloc; ++j)
+                if (!strata::core::conversation_kv_exchange(from.qsa_states[from.qsa_ord0 + j],
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    return false;
+            if (cudaDeviceSynchronize() != cudaSuccess) { e = "--kv-shared: device sync failed"; return false; }
+            return true;
+        };
+        auto kvs_reset_main = [&]() {
+            live.clear();
+            live_imgs.clear();
+            live_ok = false;
+            checks.clear();
+            tail_ckpt_len = -1;
+            kvs_trim(ss, 0);
+            kvs_main_stale = false;
+        };
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
@@ -10780,7 +10845,10 @@ int main(int argc, char** argv) {
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
-            if (slot_copy_direct) {
+            if (o.kv_shared) {
+                if (!kvs_exchange(true, b, nullptr, ids, e)) return false;
+                kvs_main_stale = true;
+            } else if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -10825,7 +10893,11 @@ int main(int argc, char** argv) {
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
-            if (slot_copy_direct && at == nullptr) {
+            if (o.kv_shared) {
+                if (!kvs_exchange(false, b, at, at != nullptr ? at->ids : bs[(size_t) b].ids, e)) return false;
+                kvs_trim(ss, kvs_target);   // the slot's cells past what this request reaches are not needed
+                if (!kvs_commit(ss, kvs_target)) { e = "--kv-shared: no RAM to map the K/V"; return false; }
+            } else if (slot_copy_direct && at == nullptr) {
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -11913,6 +11985,63 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            if (o.kv_shared) {
+                if (kvs_main_stale) kvs_reset_main();
+                // a request that leaves the main session's conversation (an aux call between two turns) would write
+                // over it: the conversation moves into a free slot first - a trade of cells, not a copy - and the next
+                // turn takes it back from there (slot_source) instead of reading it again
+                if (live_ok && !bs.empty() && (int64_t) live.size() >= 2048 && live_imgs.empty() && req_imgs.empty()) {
+                    int64_t common = 0;
+                    while (common < (int64_t) live.size() && common < n && (int64_t) live[(size_t) common] == ids[(size_t) common])
+                        ++common;
+                    if (common * 2 < (int64_t) live.size()) {
+                        int park = -1;
+                        for (int b = 0; b < (int) bs.size(); ++b) {
+                            const BSlot& sl = bs[(size_t) b];
+                            if (b == admit_slot || sl.active) continue;
+                            if (park < 0 || (!sl.cached && bs[(size_t) park].cached) ||
+                                (sl.cached == bs[(size_t) park].cached && sl.ids.size() < bs[(size_t) park].ids.size()))
+                                park = b;
+                        }
+                        std::string pe2;
+                        const auto tp = Clock::now();
+                        if (park >= 0 && copy_to_slot(park, live, pe2)) {
+                            BSlot& sl = bs[(size_t) park];
+                            sl = BSlot{};
+                            sl.ids = live;
+                            sl.cached = true;
+                            sl.cvec = cvec_cached;
+                            for (const ConvCheckpoint& c : checks)
+                                if (c.ids.size() <= live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                                    sl.checks.push_back(c);
+                            std::fprintf(stderr, "strata batch: --kv-shared keeps the conversation of %lld tokens in "
+                                                 "slot %d (moved in %.1f ms) while this request reads\n",
+                                         (long long) live.size(), park,
+                                         std::chrono::duration<double, std::milli>(Clock::now() - tp).count());
+                            kvs_reset_main();
+                        } else if (park >= 0) {
+                            std::fprintf(stderr, "strata batch: --kv-shared could not keep the conversation: %s\n",
+                                         pe2.c_str());
+                            bs[(size_t) park].cached = false;
+                            kvs_reset_main();
+                        }
+                    }
+                }
+                const long long reach = admit_slot >= 0 ? std::max(max_new, admit_max_new) : max_new;
+                kvs_target = std::min<int64_t>(o.max_context, n + (int64_t) reach + 256);
+                if ((int64_t) live.size() > kvs_target) {   // the cells past the reach go: nothing may claim them
+                    live.clear();
+                    live_imgs.clear();
+                    live_ok = false;
+                    checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
+                                     return (int64_t) c.ids.size() > kvs_target; }), checks.end());
+                }
+                kvs_trim(ss, kvs_target);
+                if (!kvs_commit(ss, kvs_target)) {
+                    std::printf("ERR --kv-shared: no RAM to map %lld cells of K/V\n", (long long) kvs_target);
+                    continue;
+                }
+            }
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -12115,6 +12244,17 @@ int main(int argc, char** argv) {
                     checks.clear();
                     resume = 0;
                     from_live = false;
+                    if (o.kv_shared) {   // the trade may have stopped half way: the slot holds nothing reusable either
+                        BSlot& sl = bs[(size_t) slot_source];
+                        sl.cached = sl.partial = false;
+                        sl.ids.clear();
+                        sl.checks.clear();
+                        kvs_trim(*bslot_ss[0][(size_t) slot_source], 0);
+                        if (!kvs_commit(ss, kvs_target)) {
+                            std::printf("ERR --kv-shared: no RAM to map the K/V\n");
+                            continue;
+                        }
+                    }
                 } else {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
@@ -12150,9 +12290,18 @@ int main(int argc, char** argv) {
                     resume = slot_tokens;
                     from_live = true;
                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
-                                 "%.1f ms\n", slot_source, (long long) slot_tokens,
+                                 "%.1f ms%s\n", slot_source, (long long) slot_tokens,
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 o.kv_shared ? " (--kv-shared: its cells moved)" : "");
+                    if (o.kv_shared) {   // the slot holds the main session's old cells now: nothing to reuse there
+                        BSlot& sl = bs[(size_t) slot_source];
+                        sl.cached = sl.partial = false;
+                        sl.ids.clear();
+                        sl.checks.clear();   // (the checkpoint taken over was copied into `checks` above)
+                        slot_ck = nullptr;
+                        kvs_trim(*bslot_ss[0][(size_t) slot_source], 0);
+                    }
                 }
             }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
@@ -14725,6 +14874,16 @@ int main(int argc, char** argv) {
                 adm_drain_ms = 0.0;
                 std::fflush(stdout);
                 admit_slot = -1;
+            }
+            if (kvs_main_stale) kvs_reset_main();   // --kv-shared: its cells went to a slot (an admission, a read that gave way)
+            if (o.kv_shared) {
+                std::string per = "main " + std::to_string(kvs_cells(ss));
+                for (size_t b = 0; b < bs.size(); ++b)
+                    per += ", slot " + std::to_string(b) + " " + std::to_string(kvs_cells(*bslot_ss[0][b])) +
+                           (bs[b].active ? " (decoding)" : bs[b].cached ? " (cached)" : "");
+                std::fprintf(stderr, "strata serve: --kv-shared: %.0f MiB of host K/V mapped (cells: %s; window %lld)\n",
+                             (double) strata::core::qsa_kv_host_mapped_bytes() / 1048576.0, per.c_str(),
+                             (long long) o.max_context);
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read

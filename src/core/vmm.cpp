@@ -12,6 +12,8 @@ namespace {
 struct Api {
     bool ok = false;
     uint64_t gran = 0;
+    bool host_ok = false;    // host-located chunks (--kv-shared)
+    uint64_t host_gran = 0;
     int dev = -1;
     decltype(&cuMemAddressReserve) reserve = nullptr;
     decltype(&cuMemAddressFree) free_va = nullptr;
@@ -62,6 +64,16 @@ const Api& api() {
         if (granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || g == 0) return;
         a.gran = g;
         a.ok = true;
+        int host = 0;
+        CUmemAllocationProp hp{};
+        hp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        hp.location.type = CU_MEM_LOCATION_TYPE_HOST;
+        size_t hg = 0;
+        if (attr(&host, CU_DEVICE_ATTRIBUTE_HOST_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev) == CUDA_SUCCESS &&
+            host && granularity(&hg, &hp, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS && hg != 0) {
+            a.host_gran = hg;
+            a.host_ok = true;
+        }
     });
     return a;
 }
@@ -87,14 +99,31 @@ void vmm_chunk_free(VmmChunk h) {
     if (h != 0 && api().ok) api().release((CUmemGenericAllocationHandle) h);
 }
 
-bool VmmRange::reserve(uint64_t bytes) {
+bool vmm_host_available() { return api().host_ok; }
+uint64_t vmm_host_granularity() { return api().host_ok ? api().host_gran : 0; }
+
+VmmChunk vmm_host_chunk_new() {
+    const Api& a = api();
+    if (!a.host_ok) return 0;
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
+    CUmemGenericAllocationHandle h = 0;
+    if (a.create(&h, (size_t) a.host_gran, &prop, 0) != CUDA_SUCCESS) return 0;
+    return (VmmChunk) h;
+}
+
+bool VmmRange::reserve(uint64_t bytes, bool host) {
     release();
     const Api& a = api();
-    if (!a.ok || bytes == 0) return false;
-    const uint64_t n = (bytes + a.gran - 1) / a.gran;
+    if (!a.ok || bytes == 0 || (host && !a.host_ok)) return false;
+    const uint64_t gran = host ? a.host_gran : a.gran;
+    const uint64_t n = (bytes + gran - 1) / gran;
     CUdeviceptr p = 0;
-    if (a.reserve(&p, (size_t) (n * a.gran), 0, 0, 0) != CUDA_SUCCESS) return false;
+    if (a.reserve(&p, (size_t) (n * gran), 0, 0, 0) != CUDA_SUCCESS) return false;
     base_ = (unsigned long long) p;
+    gran_ = gran;
+    host_ = host;
     h_.assign((size_t) n, 0);
     return true;
 }
@@ -103,9 +132,37 @@ void VmmRange::release() {
     if (base_ == 0) return;
     const Api& a = api();
     for (int64_t i = 0; i < chunks(); ++i) vmm_chunk_free(unmap(i));
-    a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * a.gran));
+    a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * gran_));
     base_ = 0;
     h_.clear();
+}
+
+std::vector<VmmChunk> VmmRange::take_all() {
+    std::vector<VmmChunk> hs(h_.size(), 0);
+    for (int64_t i = 0; i < chunks(); ++i) hs[(size_t) i] = unmap(i);
+    return hs;
+}
+
+bool VmmRange::adopt(const std::vector<VmmChunk>& hs) {
+    bool ok = hs.size() <= h_.size();
+    int64_t run = -1;
+    const int64_t n = ok ? (int64_t) hs.size() : 0;
+    for (int64_t i = 0; i <= n; ++i) {
+        const VmmChunk h = i < n ? hs[(size_t) i] : 0;
+        if (h != 0 && !mapped(i) && map_one(i, h)) {
+            if (run < 0) run = i;
+            continue;
+        }
+        if (h != 0) {                                    // could not place it: it is not lost, it is freed
+            vmm_chunk_free(h);
+            ok = false;
+        }
+        if (run >= 0 && !commit_run(run, i)) ok = false;
+        run = -1;
+    }
+    if (hs.size() > h_.size())
+        for (const VmmChunk h : hs) vmm_chunk_free(h);
+    return ok;
 }
 
 int64_t VmmRange::mapped_count() const {
@@ -116,7 +173,7 @@ int64_t VmmRange::mapped_count() const {
 
 bool VmmRange::map_one(int64_t i, VmmChunk h) {
     const Api& a = api();
-    if (a.map((CUdeviceptr) (base_ + (uint64_t) i * a.gran), (size_t) a.gran, 0, (CUmemGenericAllocationHandle) h, 0) !=
+    if (a.map((CUdeviceptr) (base_ + (uint64_t) i * gran_), (size_t) gran_, 0, (CUmemGenericAllocationHandle) h, 0) !=
         CUDA_SUCCESS)
         return false;
     h_[(size_t) i] = h;
@@ -126,12 +183,14 @@ bool VmmRange::map_one(int64_t i, VmmChunk h) {
 bool VmmRange::set_access(int64_t lo, int64_t hi) {
     if (hi <= lo) return true;
     const Api& a = api();
-    CUmemAccessDesc d{};
-    d.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    d.location.id = a.dev;
-    d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    return a.access((CUdeviceptr) (base_ + (uint64_t) lo * a.gran), (size_t) ((uint64_t) (hi - lo) * a.gran), &d, 1) ==
-           CUDA_SUCCESS;
+    CUmemAccessDesc d[2]{};
+    d[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    d[0].location.id = a.dev;
+    d[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    d[1].location.type = CU_MEM_LOCATION_TYPE_HOST;   // a host range: the CPU reads it too (snapshots, files)
+    d[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    return a.access((CUdeviceptr) (base_ + (uint64_t) lo * gran_), (size_t) ((uint64_t) (hi - lo) * gran_), d,
+                    host_ ? 2 : 1) == CUDA_SUCCESS;
 }
 
 bool VmmRange::commit_run(int64_t lo, int64_t hi) {
@@ -144,7 +203,7 @@ VmmChunk VmmRange::unmap(int64_t i) {
     if (!mapped(i)) return 0;
     const Api& a = api();
     const VmmChunk h = h_[(size_t) i];
-    if (a.unmap((CUdeviceptr) (base_ + (uint64_t) i * a.gran), (size_t) a.gran) != CUDA_SUCCESS) return 0;
+    if (a.unmap((CUdeviceptr) (base_ + (uint64_t) i * gran_), (size_t) gran_) != CUDA_SUCCESS) return 0;
     h_[(size_t) i] = 0;
     return h;
 }
@@ -158,8 +217,13 @@ bool vmm_available() { return false; }
 uint64_t vmm_granularity() { return 0; }
 VmmChunk vmm_chunk_new() { return 0; }
 void vmm_chunk_free(VmmChunk) {}
-bool VmmRange::reserve(uint64_t) { return false; }
+bool vmm_host_available() { return false; }
+uint64_t vmm_host_granularity() { return 0; }
+VmmChunk vmm_host_chunk_new() { return 0; }
+bool VmmRange::reserve(uint64_t, bool) { return false; }
 void VmmRange::release() {}
+std::vector<VmmChunk> VmmRange::take_all() { return {}; }
+bool VmmRange::adopt(const std::vector<VmmChunk>&) { return false; }
 int64_t VmmRange::mapped_count() const { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }

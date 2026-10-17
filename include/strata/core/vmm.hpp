@@ -19,6 +19,10 @@ uint64_t vmm_granularity();
 /// A new physical chunk on the current device (0: out of memory), and its release.
 VmmChunk vmm_chunk_new();
 void vmm_chunk_free(VmmChunk h);
+/// Host-located chunks (--kv-shared): pinned RAM the device reads and writes through the range, the CPU too.
+bool vmm_host_available();
+uint64_t vmm_host_granularity();
+VmmChunk vmm_host_chunk_new();
 
 class VmmRange {
 public:
@@ -27,8 +31,9 @@ public:
     VmmRange(const VmmRange&) = delete;
     VmmRange& operator=(const VmmRange&) = delete;
 
-    /// Reserves `bytes` (rounded up to whole chunks) of addresses, nothing mapped.
-    bool reserve(uint64_t bytes);
+    /// Reserves `bytes` (rounded up to whole chunks) of addresses, nothing mapped.  `host`: its chunks are host-located
+    /// (new ones from vmm_host_chunk_new) and the CPU may access them as well.
+    bool reserve(uint64_t bytes, bool host = false);
     /// Unmaps and frees every chunk, then the addresses.
     void release();
     uint8_t* base() const { return (uint8_t*) (uintptr_t) base_; }
@@ -40,6 +45,11 @@ public:
     template <class Take> bool map_range(int64_t lo, int64_t hi, Take take);
     /// Unmaps chunk i and hands back its physical chunk (0 when it was not mapped).
     VmmChunk unmap(int64_t i);
+    /// Unmaps every chunk and hands back the physical ones by index (0: was not mapped).
+    std::vector<VmmChunk> take_all();
+    /// Maps hs[i] at chunk i for every non-zero entry (the range holds none mapped there); false: a map failed,
+    /// and the chunks it could not place are freed.  With take_all() this moves physical memory between ranges.
+    bool adopt(const std::vector<VmmChunk>& hs);
 
 private:
     bool map_one(int64_t i, VmmChunk h);
@@ -48,6 +58,8 @@ private:
     /// chunk counts as mapped without access.
     bool commit_run(int64_t lo, int64_t hi);
     unsigned long long base_ = 0;
+    uint64_t gran_ = 0;   // this range's chunk size (the device's or the host's granularity)
+    bool host_ = false;
     std::vector<VmmChunk> h_;   // per chunk: its physical chunk, 0 = unmapped
 };
 
@@ -62,7 +74,7 @@ template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take
             continue;
         }
         VmmChunk h = take();
-        if (h == 0) h = vmm_chunk_new();
+        if (h == 0) h = host_ ? vmm_host_chunk_new() : vmm_chunk_new();
         if (h == 0 || !map_one(i, h)) {
             if (h != 0) vmm_chunk_free(h);
             if (run >= 0) commit_run(run, i);

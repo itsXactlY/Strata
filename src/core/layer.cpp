@@ -621,7 +621,75 @@ bool pool_grow(ElasticPool& p, int64_t cells, const std::function<strata::core::
     }
     return true;
 }
+
+// ---- the shared window (--kv-shared): a streamed state's host K/V in one fixed host range per array, mapped as far
+// as the context needs and exchanged between sessions under the same addresses, so every captured graph stays valid
+bool g_kv_lazy = false;
+struct HostKv {
+    std::vector<std::unique_ptr<strata::core::VmmRange>> arr;   // one range per host array
+    std::vector<uint64_t> per_page;                             // bytes per K/V page of each array
+    int64_t pages = 0, max_pages = 0, page_size = 0;            // pages mapped in every array, and the capacity
+};
+std::vector<std::unique_ptr<HostKv>> g_host_kv;
+
+int64_t host_chunks(const HostKv& h, size_t a, int64_t pages) {
+    const uint64_t G = strata::core::vmm_host_granularity();
+    return (int64_t) (((uint64_t) pages * h.per_page[a] + G - 1) / G);
+}
+int64_t host_pages(const HostKv& h, int64_t cells) {
+    return std::min<int64_t>(h.max_pages, (std::max<int64_t>(cells, 0) + h.page_size - 1) / h.page_size + 1);
+}
 }  // namespace
+
+void qsa_set_kv_lazy(bool on) { g_kv_lazy = on && strata::core::vmm_host_available(); }
+bool qsa_kv_lazy() { return g_kv_lazy; }
+bool qsa_kv_host_lazy(const QsaState& st) { return st.host_kv >= 0; }
+int64_t qsa_kv_host_cells(const QsaState& st) {
+    if (st.host_kv < 0) return st.max_cells;
+    const HostKv& h = *g_host_kv[(size_t) st.host_kv];
+    return std::max<int64_t>(0, h.pages - 1) * h.page_size;
+}
+bool qsa_kv_host_commit(const QsaState& st, int64_t cells) {
+    if (st.host_kv < 0) return true;
+    HostKv& h = *g_host_kv[(size_t) st.host_kv];
+    const int64_t pages = host_pages(h, cells);
+    if (pages <= h.pages) return true;
+    for (size_t a = 0; a < h.arr.size(); ++a)
+        if (!h.arr[a]->map_range(0, host_chunks(h, a, pages), [] { return (strata::core::VmmChunk) 0; })) return false;
+    h.pages = pages;
+    return true;
+}
+void qsa_kv_host_trim(const QsaState& st, int64_t cells) {
+    if (st.host_kv < 0) return;
+    HostKv& h = *g_host_kv[(size_t) st.host_kv];
+    const int64_t pages = cells > 0 ? host_pages(h, cells) : 0;
+    if (pages >= h.pages) return;
+    for (size_t a = 0; a < h.arr.size(); ++a)
+        for (int64_t c = host_chunks(h, a, pages); c < h.arr[a]->chunks(); ++c)
+            strata::core::vmm_chunk_free(h.arr[a]->unmap(c));
+    h.pages = pages;
+}
+bool qsa_kv_host_exchange(const QsaState& x, const QsaState& y) {
+    if (x.host_kv < 0 || y.host_kv < 0 || x.host_kv == y.host_kv) return false;
+    HostKv& a = *g_host_kv[(size_t) x.host_kv];
+    HostKv& b = *g_host_kv[(size_t) y.host_kv];
+    if (a.per_page != b.per_page || a.max_pages != b.max_pages) return false;
+    bool ok = true;
+    for (size_t i = 0; i < a.arr.size(); ++i) {
+        std::vector<strata::core::VmmChunk> ha = a.arr[i]->take_all(), hb = b.arr[i]->take_all();
+        ok = a.arr[i]->adopt(hb) && ok;
+        ok = b.arr[i]->adopt(ha) && ok;
+    }
+    std::swap(a.pages, b.pages);
+    if (!ok) a.pages = b.pages = 0;   // a chunk that could not be placed was freed: neither holds a whole history
+    return ok;
+}
+uint64_t qsa_kv_host_mapped_bytes() {
+    uint64_t n = 0;
+    for (const auto& h : g_host_kv)
+        for (const auto& r : h->arr) n += (uint64_t) r->mapped_count() * strata::core::vmm_host_granularity();
+    return n;
+}
 
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells) {
     g_kv_elastic = enabled && strata::core::vmm_available();
@@ -916,7 +984,37 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = strata::kernels::KvHostPools{};
-    if (p.mode != 0) {
+    st.host_kv = -1;
+    if (p.mode == 1 && g_kv_lazy) {
+        // --kv-shared: one host range per array, nothing mapped until a request commits its cells
+        const uint64_t prow = (uint64_t) s.n_head_kv * s.page_size;
+        const uint64_t scale = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        auto hk = std::make_unique<HostKv>();
+        if (st.kv_hybrid) hk->per_page = {prow * s.head_dim, prow * scale, prow * q4_row};
+        else if (st.kv_q4) hk->per_page = {prow * q4_row, prow * q4_row};
+        else if (st.kv_int8) hk->per_page = {prow * s.head_dim, prow * s.head_dim, prow * scale, prow * scale};
+        else hk->per_page = {prow * s.head_dim * 2, prow * s.head_dim * 2};
+        hk->max_pages = pages;
+        hk->page_size = s.page_size;
+        for (const uint64_t per : hk->per_page) {
+            hk->arr.push_back(std::make_unique<strata::core::VmmRange>());
+            if (!hk->arr.back()->reserve((uint64_t) pages * per, true)) {
+                std::fprintf(stderr, "strata: --kv-shared could not reserve the host K/V range\n");
+                return 0;
+            }
+        }
+        auto b = [&](size_t i) { return hk->arr[i]->base(); };
+        if (st.kv_hybrid) { st.host.k_q = (int8_t*) b(0); st.host.k_scale = (uint16_t*) b(1); st.host.v_q4 = b(2); }
+        else if (st.kv_q4) { st.host.k_q4 = b(0); st.host.v_q4 = b(1); }
+        else if (st.kv_int8) {
+            st.host.k_q = (int8_t*) b(0);
+            st.host.v_q = (int8_t*) b(1);
+            st.host.k_scale = (uint16_t*) b(2);
+            st.host.v_scale = (uint16_t*) b(3);
+        } else { st.host.k_pool = (uint16_t*) b(0); st.host.v_pool = (uint16_t*) b(1); }
+        st.host_kv = (int32_t) g_host_kv.size();
+        g_host_kv.push_back(std::move(hk));
+    } else if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;

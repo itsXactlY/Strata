@@ -241,6 +241,8 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    /// --kv-shared: `host` lives in fixed host ranges mapped on demand (layer.cpp's registry index); -1: one pinned block
+    int32_t host_kv = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -335,6 +337,22 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+/// --kv-shared (set before the states are created; needs host-located CUDA virtual memory): a streamed state's host
+/// K/V is mapped only as far as a request commits it, and two states' host K/V can trade places under their fixed
+/// addresses (captured graphs keep their pointers).  A state created without it answers as fully mapped.
+void qsa_set_kv_lazy(bool on);
+bool qsa_kv_lazy();
+bool qsa_kv_host_lazy(const QsaState& st);
+/// Cells of the state's host K/V that are mapped.
+int64_t qsa_kv_host_cells(const QsaState& st);
+/// Maps the host K/V up to `cells`; false: out of memory (what was mapped stays mapped).
+bool qsa_kv_host_commit(const QsaState& st, int64_t cells);
+/// Unmaps and frees the host K/V past `cells` (0: all of it).
+void qsa_kv_host_trim(const QsaState& st, int64_t cells);
+/// Trades the physical host K/V of two lazy states of one layout; false: a chunk was lost (neither is whole).
+bool qsa_kv_host_exchange(const QsaState& a, const QsaState& b);
+/// Host bytes mapped by every lazy state.
+uint64_t qsa_kv_host_mapped_bytes();
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);

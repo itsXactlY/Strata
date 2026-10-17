@@ -241,6 +241,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
         error = "conversation snapshot: direct K/V copy between different layouts";
         return false;
     }
+    if (!qsa_kv_host_commit(to, upto)) { error = "conversation snapshot: no RAM to map the K/V (--kv-shared)"; return false; }
     // The same bytes conversation_kv_save + conversation_kv_restore move, without the host image: each part
     // straight from the source's authoritative pool into the target's (device or mapped host memory), through the
     // private non-blocking stream the other snapshot copies use (complete on return, before the residency refresh).
@@ -261,8 +262,28 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     return refresh_residency(to, g, upto, error);
 }
 
+bool conversation_kv_exchange(const QsaState& from, const QsaState& to, const ModelGeometry& g, int64_t upto, bool index,
+                              std::string& error) {
+    Layout lf{}, lt{};
+    if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
+        !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
+    if (from.kv_mode != 1 || to.kv_mode != 1 || lf.format != lt.format || lf.pooled != lt.pooled) {
+        error = "conversation snapshot: K/V exchange between different layouts";
+        return false;
+    }
+    // the history's cells move under `to`'s addresses (and `to`'s old ones under `from`'s, which now holds nothing
+    // the caller may reuse); the indexer's pooled keys are device memory and are copied
+    if (!qsa_kv_host_exchange(from, to)) {
+        error = "conversation snapshot: --kv-shared could not move the host K/V (out of memory)";
+        return false;
+    }
+    if (!transfer(to.idx_pooled, from.idx_pooled, lf.pooled, error)) return false;
+    return refresh_residency(from, g, 0, error) && refresh_residency(to, g, upto, error);
+}
+
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
+    if (!qsa_kv_host_commit(st, upto)) { error = "conversation snapshot: no RAM to map the K/V (--kv-shared)"; return false; }
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
@@ -279,6 +300,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
         error = "conversation snapshot: prefix beyond the captured K/V";
         return false;
     }
+    if (!qsa_kv_host_commit(st, upto)) { error = "conversation snapshot: no RAM to map the K/V (--kv-shared)"; return false; }
     if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
     Layout l{};   // the prefix's extent; validation above checked the image against the captured one
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;

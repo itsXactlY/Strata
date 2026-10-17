@@ -31,6 +31,11 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // and the caller synchronizes the device before it reads or writes either state.
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error, bool queued = false);
+// --kv-shared: the same result for `to` as conversation_kv_copy, without moving bytes - the two streamed states trade
+// their host K/V (qsa_kv_host_exchange) and only the indexer's pooled keys are copied.  `from` is left holding `to`'s
+// old cells, which nothing may reuse.  The caller synchronized the device.
+bool conversation_kv_exchange(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                              int64_t upto, bool include_index, std::string& error);
 // The first `upto` tokens of an image captured at `captured` tokens: the leading bytes of each buffer (cells come
 // first in the identity layout, as conversation_kv_save takes them), the image untouched.  Cells and indexer rows
 // past `upto` in the restored pages hold the image's later tokens until a request writes them, as after a whole
