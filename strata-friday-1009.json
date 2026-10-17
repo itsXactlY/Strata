@@ -1,0 +1,59 @@
+{
+  "exe": "/home/alca/projects/llama.cpp-strata/engine/strata.holygoat-806442f-built-20261015",
+  "args": [
+    "--pack",
+    "/home/alca/projects/Strata-data/packs/coder-iq1_m",
+    "--native",
+    "/home/alca/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/home/alca/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/coder-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf",
+    "--expert-profile",
+    "/home/alca/projects/llama.cpp-strata/data/expert-profile-coder.bin",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "auto",
+    "--spec",
+    "4",
+    "--mtp",
+    "/home/alca/projects/Strata-data/mtp/rt",
+    "--max-context",
+    "86000",
+    "--kv-resident",
+    "32768",
+    "--kv",
+    "int8",
+    "--spec-min-p",
+    "0.5",
+    "--vram-reserve-mib",
+    "1200",
+    "--conversation-cache-mib",
+    "4096",
+    "--conversation-cache-slots",
+    "2",
+    "--conversation-cache-min-free-mib",
+    "1024",
+    "--resident-budget-gib",
+    "28"
+  ],
+  "cwd": "/home/alca/projects/llama.cpp-strata",
+  "tokenizer": "/home/alca/projects/Strata-data/packs/coder-iq1_m/tokenizer",
+  "model_name": "qwen3.8-flash-next-coder-iq1_m",
+  "log": "/home/alca/projects/llama.cpp-strata/strata-friday-1009.log",
+  "lib_dirs": [
+    "/opt/cuda/bin",
+    "/opt/cuda/lib64"
+  ],
+  "port": 8080,
+  "gpu": 0,
+  "gpus_asked": true,
+  "env": {
+    "STRATA_KV_TAPE_HOST": "1",
+    "STRATA_KV_TAPE_DEBUG": "1"
+  },
+  "_notes": {
+    "what": "Fri 2026-10-09 19:35 run (Monitor: Since Fr., 19:35). Daedalus saw context 86,000 from 19:42 until 10-10 01:35.",
+    "engine": "806442fd (0.1.37 + TAPE 08f07c31 + holygoat kv_stream_host); the 10-09 binary itself was overwritten, this is the 10-15 rebuild of that commit",
+    "config": "earliest committed 86k config 626851a6 (10-10) with --vram-reserve-mib 1200 per mazemaker decision:strata-final-config-r1200-slots2 (id 1362615)"
+  }
+}
