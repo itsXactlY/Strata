@@ -684,6 +684,18 @@ bool qsa_kv_host_exchange(const QsaState& x, const QsaState& y) {
     if (!ok) a.pages = b.pages = 0;   // a chunk that could not be placed was freed: neither holds a whole history
     return ok;
 }
+uint64_t qsa_kv_host_hash(const QsaState& st, int64_t cells) {
+    if (st.host_kv < 0) return 0;
+    const HostKv& h = *g_host_kv[(size_t) st.host_kv];
+    const int64_t pages = std::min<int64_t>(h.max_pages, (cells + h.page_size - 1) / h.page_size);
+    uint64_t x = 1469598103934665603ull;
+    for (size_t a = 0; a < h.arr.size(); ++a) {
+        const uint64_t* p = (const uint64_t*) h.arr[a]->base();
+        const uint64_t n = (uint64_t) pages * h.per_page[a] / 8;
+        for (uint64_t i = 0; i < n; ++i) x = (x ^ p[i]) * 1099511628211ull;
+    }
+    return x;
+}
 uint64_t qsa_kv_host_mapped_bytes() {
     uint64_t n = 0;
     for (const auto& h : g_host_kv)

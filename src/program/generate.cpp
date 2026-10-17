@@ -10796,10 +10796,35 @@ int main(int argc, char** argv) {
                     !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                     return false;
             }
+            // STRATA_KV_SHARED_COPY=1: the same paths with the cells copied instead of traded (the A/B for the trade)
+            static const bool copy_cells = [] {
+                const char* v = std::getenv("STRATA_KV_SHARED_COPY");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            // STRATA_KV_SHARED_VERIFY=1: every layer's host cells hashed before the trade and under `to` after it
+            static const bool verify = [] {
+                const char* v = std::getenv("STRATA_KV_SHARED_VERIFY");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            std::vector<uint64_t> before;
+            if (verify)
+                for (int64_t j = 0; j < from.qsa_alloc; ++j)
+                    before.push_back(strata::core::qsa_kv_host_hash(from.qsa_states[from.qsa_ord0 + j], upto));
             for (int64_t j = 0; j < from.qsa_alloc; ++j)
-                if (!strata::core::conversation_kv_exchange(from.qsa_states[from.qsa_ord0 + j],
-                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                if (copy_cells ? !strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
+                                                                     to.qsa_states[to.qsa_ord0 + j], g, upto, true, e)
+                               : !strata::core::conversation_kv_exchange(from.qsa_states[from.qsa_ord0 + j],
+                                                                         to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                     return false;
+            if (verify) {
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "--kv-shared: device sync failed"; return false; }
+                int64_t bad = 0;
+                for (int64_t j = 0; j < to.qsa_alloc; ++j)
+                    bad += strata::core::qsa_kv_host_hash(to.qsa_states[to.qsa_ord0 + j], upto) != before[(size_t) j];
+                std::fprintf(stderr, "strata batch: --kv-shared verify: %s %lld cells, %lld layers, %lld differ%s\n",
+                             into_slot ? "main -> slot" : "slot -> main", (long long) upto, (long long) to.qsa_alloc,
+                             (long long) bad, bad ? "  <-- MISMATCH" : "");
+            }
             if (cudaDeviceSynchronize() != cudaSuccess) { e = "--kv-shared: device sync failed"; return false; }
             return true;
         };

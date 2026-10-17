@@ -353,6 +353,8 @@ void qsa_kv_host_trim(const QsaState& st, int64_t cells);
 bool qsa_kv_host_exchange(const QsaState& a, const QsaState& b);
 /// Host bytes mapped by every lazy state.
 uint64_t qsa_kv_host_mapped_bytes();
+/// FNV-1a of the first `cells` of a lazy state's host K/V, read by the CPU (STRATA_KV_SHARED_VERIFY; 0: not lazy).
+uint64_t qsa_kv_host_hash(const QsaState& st, int64_t cells);
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
